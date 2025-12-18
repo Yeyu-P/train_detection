@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data and logs
+train_data/
+train_logs/
+*.log
+*.db
+*.db-journal
+
+# Temporary files
+*.tmp
+*.bak
+nohup.out
+detector.log
+server.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output files
+*.csv
+events_*.jsonl
+raw_*.json
+calibration_data/

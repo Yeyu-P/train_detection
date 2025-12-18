@@ -1,0 +1,106 @@
+{
+  "system": {
+    "name": "Railway Track Monitoring System",
+    "version": "1.0",
+    "location": "Track Section A",
+    "timezone": "Pacific/Auckland"
+  },
+  
+  "detection": {
+    "threshold_g": 2.0,
+    "min_duration_sec": 0.5,
+    "cooldown_sec": 3.0,
+    "background_window_samples": 50,
+    "sample_rate_hz": 50
+  },
+  
+  "storage": {
+    "data_dir": "/home/pi/train_data",
+    "log_dir": "/home/pi/train_logs",
+    "save_raw_data": true,
+    "auto_cleanup_days": 30,
+    "max_log_size_mb": 50,
+    "max_log_files": 5
+  },
+  
+  "network": {
+    "enabled": true,
+    "upload_mode": "immediate",
+    "server_url": "https://your-server.com/api",
+    "api_key": "your-secret-key-here",
+    "retry_max_attempts": 3,
+    "retry_interval_sec": 10,
+    "timeout_sec": 10,
+    "offline_cache_max_items": 1000
+  },
+  
+  "monitoring": {
+    "health_check_interval_sec": 300,
+    "status_upload_interval_sec": 300,
+    "max_no_data_sec": 60
+  },
+  
+  "reconnect": {
+    "enabled": true,
+    "max_attempts": 5,
+    "interval_sec": 10
+  },
+  
+  "led": {
+    "enabled": false,
+    "pin_power": 17,
+    "pin_detecting": 27,
+    "pin_error": 22
+  },
+  
+  "devices": [
+    {
+      "number": 1,
+      "name": "Device_1",
+      "mac": "AB35487E-B200-B802-E526-C512EA064361",
+      "enabled": true
+    },
+    {
+      "number": 2,
+      "name": "Device_2",
+      "mac": "DB2124E5-ED94-BFB1-FC33-452B097ABA8E",
+      "enabled": true
+    },
+    {
+      "number": 3,
+      "name": "Device_3",
+      "mac": "4AD2A5F1-6B30-8924-F3E7-B2711CBE2ED5",
+      "enabled": true
+    },
+    {
+      "number": 4,
+      "name": "Device_4",
+      "mac": "DD98E8F7-E19A-A396-5697-601C52E20E17",
+      "enabled": true
+    },
+    {
+      "number": 5,
+      "name": "Device_5",
+      "mac": "D16EF45D-8D4C-65C8-BF67-5462DD84BE9D",
+      "enabled": false
+    },
+    {
+      "number": 6,
+      "name": "Device_6",
+      "mac": "41775641-ABF2-6EF6-5FD9-47001110D0FB",
+      "enabled": false
+    },
+    {
+      "number": 7,
+      "name": "Device_7",
+      "mac": "2FC82242-3CC9-2872-9EF9-155429522CD4",
+      "enabled": false
+    },
+    {
+      "number": 8,
+      "name": "Device_8",
+      "mac": "21D57F6B-0E07-C53F-3973-EE54A27BFFB4",
+      "enabled": false
+    }
+  ]
+}

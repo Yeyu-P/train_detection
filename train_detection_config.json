@@ -1,0 +1,53 @@
+{
+  "devices": [
+    {
+      "number": 1,
+      "name": "Device_1",
+      "mac": "E3:CA:3A:0D:D6:D0",
+      "enabled": true
+    },
+    {
+      "number": 2,
+      "name": "Device_2",
+      "mac": "CF:3C:37:5F:BC:41",
+      "enabled": true
+    },
+    {
+      "number": 3,
+      "name": "Device_3",
+      "mac": "E6:1F:C4:87:81:74",
+      "enabled": true
+    },
+    {
+      "number": 4,
+      "name": "Device_4",
+      "mac": "EB:68:B5:C1:60:1C",
+      "enabled": true
+    }
+  ],
+  "detection": {
+    "threshold": 2.0,
+    "trigger_ratio": 0.7,
+    "window_duration": 1.0,
+    "post_trigger_duration": 5.0,
+    "pre_buffer_duration": 5.0,
+    "sampling_rate": 50
+  },
+  "storage": {
+    "local_path": "train_events",
+    "db_name": "events.db"
+  },
+  "cloud": {
+    "enabled": true,
+    "upload_url": "http://localhost:8000/api/upload",
+    "upload_interval": 60,
+    "retry_count": 3,
+    "retry_delay": 5
+  },
+  "system": {
+    "connection_timeout": 30,
+    "data_timeout": 5,
+    "status_interval": 30,
+    "log_level": "INFO"
+  }
+}

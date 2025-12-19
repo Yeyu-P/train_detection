@@ -1,264 +1,410 @@
-# 火车检测系统 - Railway Track Monitoring System
+# Train Detection System
 
-基于IMU传感器的火车通过检测系统，带网络数据上传功能。
+Real-time train detection system using multiple IMU sensors with cloud upload capability.
 
-## 📁 文件说明
+## Features
 
-```
-train_detection_final/
-├── system_config.json              # 配置文件（修改这个）
-├── train_detector_network.py       # 主程序（树莓派运行）
-├── witmotion_device_model_clean.py # 设备驱动（不需要改）
-├── server.py                       # 后端服务器
-├── calibration_tool.py             # 阈值标定工具
-└── README.md                       # 本文档
-```
+- **Multi-device support**: Simultaneously monitor up to 8 IMU devices
+- **Sliding window trigger**: Robust detection using statistical threshold crossing (70% of samples over 1 second)
+- **Circular buffering**: Captures 5 seconds of data before trigger event
+- **Local storage**: SQLite database + CSV files + JSON metadata
+- **Cloud upload**: Automatic background upload with retry logic
+- **Production ready**: Signal handling, logging, configurable parameters
 
-## 🚀 快速开始
+## System Requirements
 
-### 1. 树莓派上安装依赖
+- Python 3.7+
+- Raspberry Pi (recommended) or Linux system
+- Bluetooth LE support
+- WitMotion BWT901CL IMU sensors (or compatible)
 
-```bash
-# 更新系统
-sudo apt update
+## Installation
 
-# 安装依赖
-sudo apt install -y python3-pip python3-numpy bluetooth bluez
-pip3 install bleak numpy requests flask --break-system-packages
-
-# 配置蓝牙权限
-sudo setcap 'cap_net_raw,cap_net_admin+eip' $(readlink -f $(which python3))
-```
-
-### 2. 克隆仓库到树莓派
+### 1. Install Dependencies
 
 ```bash
-cd ~
-git clone https://github.com/你的用户名/你的仓库名.git train_detection
-cd train_detection
+pip3 install bleak asyncio requests flask
 ```
 
-### 3. 修改配置文件
+### 2. Configure Devices
 
-```bash
-nano system_config.json
-```
+Edit `train_detection_config.json`:
 
-**必须修改的3个地方：**
-
-1. **设备MAC地址** - 设置你的IMU设备
 ```json
-"devices": [
-  {
-    "name": "Device_1",
-    "mac": "AB35487E-B200-B802-E526-C512EA064361",  // ← 改成你的MAC地址
-    "enabled": true  // ← 设为true启用
-  }
-]
-```
-
-2. **服务器地址** - 先用本地测试
-```json
-"network": {
-  "enabled": true,
-  "server_url": "http://localhost:5000/api",  // ← 本地服务器
-  "api_key": "test-key-123"  // ← 随便设一个密钥
+{
+  "devices": [
+    {
+      "number": 1,
+      "name": "Device_1",
+      "mac": "E3:CA:3A:0D:D6:D0",
+      "enabled": true
+    }
+  ]
 }
 ```
 
-3. **检测阈值** - 标定后再改
-```json
-"detection": {
-  "threshold_g": 2.0  // ← 先用默认值，标定后修改
-}
-```
+**Note**: Use MAC address format (XX:XX:XX:XX:XX:XX) for Linux/Raspberry Pi.
 
-### 4. 启动后端服务器（在树莓派上）
+### 3. Bluetooth Setup (Raspberry Pi)
 
 ```bash
-# 修改server.py的API密钥（和配置文件一致）
-nano server.py
-# 找到: API_KEY = 'your-secret-key-here'
-# 改成: API_KEY = 'test-key-123'
+# Enable Bluetooth
+sudo systemctl start bluetooth
+sudo systemctl enable bluetooth
 
-# 后台启动服务器
-python3 server.py &
+# Grant permissions
+sudo usermod -a -G bluetooth $USER
 ```
 
-### 5. 阈值标定（重要！）
+## Configuration
 
-```bash
-# 采集60秒数据
-python3 calibration_tool.py system_config.json 60
+All parameters are in `train_detection_config.json`:
 
-# 记下建议阈值，例如：建议阈值: 1.174g
-# 修改配置文件
-nano system_config.json
-# 把 "threshold_g": 2.0 改成标定的值
-```
-
-### 6. 运行主程序
-
-```bash
-# 前台运行（测试）
-python3 train_detector_network.py system_config.json
-
-# 后台运行（生产）
-nohup python3 train_detector_network.py system_config.json > detector.log 2>&1 &
-```
-
-### 7. 查看数据
-
-**浏览器查看：**
-```
-http://树莓派IP:5000/api/stats          # 统计信息
-http://树莓派IP:5000/api/events/recent  # 最近事件
-```
-
-**查询数据库：**
-```bash
-sqlite3 train_monitoring.db
-SELECT * FROM train_events ORDER BY start_time DESC LIMIT 10;
-.quit
-```
-
-## 📊 配置文件详解
-
-### system_config.json 主要参数
+### Detection Parameters
 
 ```json
 {
   "detection": {
-    "threshold_g": 2.0,          // 检测阈值（g），标定后修改
-    "min_duration_sec": 0.5,     // 最小持续时间（秒）
-    "cooldown_sec": 3.0          // 冷却时间（秒）
-  },
-  
-  "storage": {
-    "save_raw_data": true,       // 是否保存原始数据
-    "auto_cleanup_days": 30      // 自动清理旧数据（天）
-  },
-  
-  "network": {
-    "enabled": true,             // 是否启用网络上传
-    "server_url": "http://...",  // 服务器地址
-    "api_key": "your-key"        // API密钥
+    "threshold": 2.0,              // Acceleration threshold (g)
+    "trigger_ratio": 0.7,          // 70% of samples must exceed threshold
+    "window_duration": 1.0,        // Detection window (seconds)
+    "post_trigger_duration": 5.0,  // Record duration after trigger (seconds)
+    "pre_buffer_duration": 5.0,    // Buffer duration before trigger (seconds)
+    "sampling_rate": 50            // Sampling rate (Hz)
   }
 }
 ```
 
-## 🔧 常见操作
+### Trigger Logic
 
-### 查看运行日志
-```bash
-tail -f ~/train_logs/system.log
+The system uses a **sliding window** approach:
+
+1. Maintains 1-second window (50 samples at 50Hz)
+2. Counts how many samples exceed threshold
+3. Triggers if ≥70% of samples exceed threshold
+4. Records: 5s before + 5s after = 10 seconds total
+
+**Example**: Train passing
+```
+Time:    0s    0.5s   1.0s   1.5s   2.0s
+Accel:  0.5g   2.3g   2.8g   2.6g   2.9g
+Window:       [-------- 1 second --------]
+                  35/50 samples > 2.0g
+                  = 70% → TRIGGER!
 ```
 
-### 停止程序
-```bash
-ps aux | grep train_detector
-kill <进程ID>
+### Storage Configuration
+
+```json
+{
+  "storage": {
+    "local_path": "train_events",  // Local storage directory
+    "db_name": "events.db"         // SQLite database filename
+  }
+}
 ```
 
-### 导出数据到CSV
-```bash
-sqlite3 -header -csv train_monitoring.db \
-  "SELECT * FROM train_events" > events.csv
+### Cloud Upload
+
+```json
+{
+  "cloud": {
+    "enabled": true,                              // Enable/disable upload
+    "upload_url": "http://localhost:8000/api/upload",
+    "upload_interval": 60,                        // Check interval (seconds)
+    "retry_count": 3,                            // Retry attempts per event
+    "retry_delay": 5                             // Delay between retries (seconds)
+  }
+}
 ```
 
-### 清理旧数据
+## Usage
+
+### Basic Usage
+
 ```bash
-# 删除30天前的数据
-find ~/train_data -type f -mtime +30 -delete
+# Start detection system
+python3 train_detector.py
 ```
 
-## 🐛 故障排查
+### Test with Mock Server
 
-### 设备连接失败
+Terminal 1 - Start mock cloud server:
 ```bash
-# 扫描蓝牙设备
-sudo hcitool lescan
+python3 mock_server.py
+```
 
-# 检查蓝牙服务
+Terminal 2 - Start detection system:
+```bash
+python3 train_detector.py
+```
+
+The system will automatically upload events to `http://localhost:8000/api/upload`.
+
+### Production Deployment
+
+```bash
+# Run in background
+nohup python3 train_detector.py > detector.log 2>&1 &
+
+# View logs
+tail -f detector.log
+
+# Stop
+pkill -f train_detector.py
+```
+
+### Systemd Service (Auto-start)
+
+Create `/etc/systemd/system/train-detector.service`:
+
+```ini
+[Unit]
+Description=Train Detection System
+After=network.target bluetooth.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/train_detection
+ExecStart=/usr/bin/python3 /home/pi/train_detection/train_detector.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable train-detector
+sudo systemctl start train-detector
+
+# View logs
+sudo journalctl -u train-detector -f
+```
+
+## Data Structure
+
+### Directory Layout
+
+```
+train_events/
+├── events.db                          # SQLite database
+└── event_20251219_143052/            # Single event folder
+    ├── device_1.csv                  # Device 1 data
+    ├── device_2.csv                  # Device 2 data
+    ├── device_3.csv                  # Device 3 data
+    ├── device_4.csv                  # Device 4 data
+    └── metadata.json                 # Event metadata
+```
+
+### CSV Format
+
+```csv
+timestamp,AccX,AccY,AccZ,AngX,AngY,AngZ,AsX,AsY,AsZ
+2025-12-19 14:30:47.123,0.123,0.456,0.789,1.2,3.4,5.6,10.5,20.3,30.1
+```
+
+Fields:
+- `timestamp`: ISO format with milliseconds
+- `AccX/Y/Z`: Acceleration (g)
+- `AngX/Y/Z`: Angle (degrees)
+- `AsX/Y/Z`: Angular velocity (degrees/second)
+
+### Metadata Format
+
+```json
+{
+  "event_id": "event_20251219_143052",
+  "timestamp": "2025-12-19T14:30:52",
+  "trigger_device": 1,
+  "max_acceleration": 3.456,
+  "duration": 10.0,
+  "threshold": 2.0,
+  "trigger_ratio": 0.7,
+  "devices": [1, 2, 3, 4],
+  "sampling_rate": 50
+}
+```
+
+### SQLite Schema
+
+```sql
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY,
+    event_id TEXT UNIQUE,
+    timestamp TEXT,
+    trigger_device INTEGER,
+    max_acceleration REAL,
+    duration REAL,
+    num_devices INTEGER,
+    data_path TEXT,
+    uploaded INTEGER DEFAULT 0,
+    upload_time TEXT
+);
+```
+
+## Parameter Tuning
+
+### Conservative (Avoid false positives)
+
+```json
+{
+  "threshold": 2.5,
+  "trigger_ratio": 0.8,
+  "window_duration": 1.0
+}
+```
+
+Use when: High environmental vibration, near roads/construction.
+
+### Standard (Recommended)
+
+```json
+{
+  "threshold": 2.0,
+  "trigger_ratio": 0.7,
+  "window_duration": 1.0
+}
+```
+
+Use when: Normal environment, typical train detection.
+
+### Sensitive (Catch all events)
+
+```json
+{
+  "threshold": 1.5,
+  "trigger_ratio": 0.6,
+  "window_duration": 1.0
+}
+```
+
+Use when: Long distance detection, slow-moving trains.
+
+## Troubleshooting
+
+### Connection Issues
+
+```bash
+# Check Bluetooth
 sudo systemctl status bluetooth
+sudo bluetoothctl
 
-# 重启蓝牙
-sudo systemctl restart bluetooth
+# Scan for devices
+> scan on
+> devices
+
+# Manual disconnect
+> disconnect E3:CA:3A:0D:D6:D0
 ```
 
-### 网络上传失败
+### View Database
+
 ```bash
-# 检查服务器是否运行
-ps aux | grep server.py
+sqlite3 train_events/events.db
 
-# 测试连接
-curl http://localhost:5000/
+# List all events
+SELECT * FROM events;
 
-# 查看上传日志
-grep "上传" ~/train_logs/system.log
+# Count events
+SELECT COUNT(*) FROM events;
+
+# View unuploaded
+SELECT * FROM events WHERE uploaded = 0;
 ```
 
-### 查看详细错误
+### Check Logs
+
 ```bash
-# 前台运行查看详细信息
-python3 train_detector_network.py system_config.json
+# Real-time monitoring
+tail -f detector.log
+
+# Search for triggers
+grep "TRIGGER" detector.log
+
+# Count events today
+grep "EVENT STARTED" detector.log | grep "2025-12-19" | wc -l
 ```
 
-## 📈 性能优化
+### Performance
 
-### 如果不需要原始数据（节省空间）
+- **CPU Usage**: <5% on Raspberry Pi 4
+- **Memory**: ~50MB per device
+- **Storage**: ~50KB per 10-second event (4 devices)
+- **Connection Time**: 5-15 seconds for 4 devices parallel
+
+## Data Analysis
+
+### Python Example
+
+```python
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Load event data
+df = pd.read_csv('train_events/event_20251219_143052/device_1.csv')
+
+# Plot acceleration
+plt.figure(figsize=(12, 6))
+plt.plot(df.index, df['AccZ'], label='Z-axis')
+plt.xlabel('Sample')
+plt.ylabel('Acceleration (g)')
+plt.title('Train Detection Event')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Statistics
+print(f"Max acceleration: {df['AccZ'].abs().max():.2f}g")
+print(f"Mean acceleration: {df['AccZ'].mean():.2f}g")
+print(f"Duration: {len(df) / 50:.1f}s")
+```
+
+## Cloud API Specification
+
+### Upload Endpoint
+
+**POST** `/api/upload`
+
+**Content-Type**: `multipart/form-data`
+
+**Parameters**:
+- `metadata` (form field): JSON string with event metadata
+- `device_1.csv` (file): Device 1 CSV data
+- `device_2.csv` (file): Device 2 CSV data
+- ... (one file per device)
+
+**Response** (200 OK):
 ```json
-"storage": {
-  "save_raw_data": false  // 只保存事件摘要
+{
+  "status": "success",
+  "event_id": "event_20251219_143052",
+  "message": "Event uploaded successfully"
 }
 ```
 
-### 如果网络不稳定
+**Response** (400/500 Error):
 ```json
-"network": {
-  "retry_max_attempts": 5,     // 增加重试次数
-  "offline_cache_max_items": 2000  // 增加离线缓存
+{
+  "error": "Error description"
 }
 ```
 
-## 🌐 部署到云服务器
+### Example Implementation
 
-当老板要求上云时：
+See `mock_server.py` for a complete Flask-based implementation.
 
-1. **买云服务器**，得到公网IP
-
-2. **在云服务器上运行 server.py**
-```bash
-# 安装依赖
-pip3 install flask
-
-# 启动服务器
-nohup python3 server.py > server.log 2>&1 &
-```
-
-3. **修改树莓派配置**
-```json
-"network": {
-  "server_url": "http://你的服务器IP:5000/api"
-}
-```
-
-4. **重启树莓派程序**
-```bash
-kill <进程ID>
-python3 train_detector_network.py system_config.json
-```
-
-## 📞 技术支持
-
-- 查看日志：`~/train_logs/system.log`
-- 数据库位置：`~/train_detection/train_monitoring.db`
-- 配置文件：`~/train_detection/system_config.json`
-
-## 📄 License
+## License
 
 MIT License
 
-## 👤 Author
+## Support
 
-Yeyu Pan - PhD Student, University of Auckland
+For issues or questions, please check:
+1. Bluetooth connection status
+2. Device MAC addresses in config
+3. Log files for error messages
+4. System resource availability (CPU, memory, disk)

@@ -812,12 +812,23 @@ class TrainDetector:
         self.recording = True
         self.trigger_time = timestamp
         self.trigger_device = device_number
-        self.event_id = datetime.fromtimestamp(timestamp).strftime('%Y%m%d_%H%M%S')
+        
+        # Generate unique event ID with milliseconds and counter
+        base_id = datetime.fromtimestamp(timestamp).strftime('%Y%m%d_%H%M%S_%f')[:19]  # Include microseconds, truncate to milliseconds
+        
+        # Ensure uniqueness by adding counter if needed
+        event_id = base_id
+        counter = 1
+        while (self.output_dir / f"event_{event_id}").exists():
+            event_id = f"{base_id}_{counter}"
+            counter += 1
+        
+        self.event_id = event_id
         self.event_data = {}
         
         print(f"\nTRAIN DETECTED!")
         print(f"   Device: {device_number}")
-        print(f"   Time: {datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"   Time: {datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
         print(f"   Magnitude: {magnitude:.3f}g")
         print(f"   Recording for {self.post_trigger_duration}s...")
         
@@ -983,36 +994,6 @@ class TrainDetector:
         except Exception as e:
             logger.error(f"Error saving event data: {e}")
             print(f"   ERROR saving event: {e}\n")
-        
-        # Save metadata
-        metadata = {
-            'event_id': self.event_id,
-            'trigger_device': self.trigger_device,
-            'trigger_time': datetime.fromtimestamp(self.trigger_time).isoformat(),
-            'duration': duration,
-            'threshold': self.threshold,
-            'max_acceleration': max_acc,
-            'num_devices': len(self.event_data),
-            'devices': list(self.event_data.keys())
-        }
-        
-        with open(event_dir / 'metadata.json', 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        # Save to database
-        self._save_to_database(metadata, str(event_dir))
-        
-        # Update statistics
-        self.stats['total_events'] += 1
-        self.stats['last_event_time'] = self.trigger_time
-        
-        print(f"   Event saved: {event_dir.name}")
-        print(f"   Max acceleration: {max_acc:.3f}g")
-        print(f"   Total events: {self.stats['total_events']}\n")
-        
-        # Reset state
-        self.recording = False
-        self.event_data = {}
     
     def _save_to_database(self, metadata, data_path, trigger_time):
         """Save to database with explicit column names"""

@@ -1,0 +1,15 @@
+# Train Detection System - Professional Edition
+# Python Dependencies
+
+# BLE communication
+bleak>=0.21.0
+
+# Async HTTP for cloud upload
+aiohttp>=3.8.0
+
+# Standard library (usually included, listed for completeness)
+asyncio
+
+# Optional: For testing and development
+# pytest>=7.0.0
+# pytest-asyncio>=0.21.0

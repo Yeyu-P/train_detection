@@ -1,0 +1,76 @@
+{
+  "detection": {
+    "threshold_g": 2.0,
+    "min_duration_seconds": 1.0,
+    "post_trigger_duration_seconds": 5.0,
+    "sliding_window": {
+      "enabled": true,
+      "window_size_samples": 50,
+      "trigger_percentage": 70.0,
+      "threshold_g": 1.5
+    }
+  },
+  "health_check": {
+    "enabled": true,
+    "first_frame_timeout_seconds": 10.0,
+    "grace_period_seconds": 5.0,
+    "data_stale_timeout_seconds": 3.0,
+    "reconnect_cooldown_seconds": 10.0
+  },
+  "buffer": {
+    "max_seconds": 5,
+    "sample_rate_hz": 50
+  },
+  "connection": {
+    "sequential_connection": true,
+    "connection_timeout_seconds": 30,
+    "inter_device_delay_seconds": 1.0,
+    "max_retries": 3,
+    "retry_delay_seconds": 5.0
+  },
+  "os_cleanup": {
+    "enabled": true,
+    "cooldown_seconds": 300,
+    "auto_cleanup_on_failure": true
+  },
+  "cloud_upload": {
+    "enabled": true,
+    "endpoint": "http://localhost:8000/api/health",
+    "upload_interval_seconds": 60,
+    "timeout_seconds": 5.0,
+    "retry_attempts": 3,
+    "include_raw_data": false
+  },
+  "logging": {
+    "level": "INFO",
+    "console_output": true,
+    "file_output": true,
+    "log_file": "train_detector.log"
+  },
+  "devices": [
+    {
+      "number": 1,
+      "name": "Device_1",
+      "mac": "E3:CA:3A:0D:D6:D0",
+      "enabled": true
+    },
+    {
+      "number": 2,
+      "name": "Device_2",
+      "mac": "CF:3C:37:5F:BC:41",
+      "enabled": true
+    },
+    {
+      "number": 3,
+      "name": "Device_3",
+      "mac": "E6:1F:C4:87:81:74",
+      "enabled": true
+    },
+    {
+      "number": 4,
+      "name": "Device_4",
+      "mac": "EB:68:B5:C1:60:1C",
+      "enabled": true
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "devices": [
+    {
+      "number": 1,
+      "name": "Device_1",
+      "mac": "E3:CA:3A:0D:D6:D0",
+      "enabled": true
+    },
+    {
+      "number": 2,
+      "name": "Device_2",
+      "mac": "CF:3C:37:5F:BC:41",
+      "enabled": true
+    },
+    {
+      "number": 3,
+      "name": "Device_3",
+      "mac": "E6:1F:C4:87:81:74",
+      "enabled": true
+    },
+    {
+      "number": 4,
+      "name": "Device_4",
+      "mac": "EB:68:B5:C1:60:1C",
+      "enabled": true
+    }
+  ],
+  "sliding_window": {
+    "enabled": true,
+    "window_size": 50,
+    "threshold": 1.5,
+    "trigger_percentage": 70.0
+  },
+  "upload": {
+    "enabled": true,
+    "url": "http://localhost:8000/api/data",
+    "interval": 60
+  }
+}

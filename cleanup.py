@@ -1,181 +1,137 @@
 #!/usr/bin/env python3
 """
-Bluetooth Device Cleanup Utility
-Force disconnect all IMU devices to resolve connection conflicts
+清理脚本 - 强制断开所有IMU设备连接
+用于解决连接残留问题
 """
-
 import asyncio
 import json
 import sys
-from bleak import BleakScanner
 
-async def disconnect_device(mac_address):
-    """Attempt to disconnect a device by MAC address"""
+try:
+    import bleak
+except ImportError:
+    print("❌ bleak not installed! Run: pip3 install bleak")
+    sys.exit(1)
+
+
+async def disconnect_device(mac_address, name):
+    """断开指定设备"""
+    print(f"🔌 Disconnecting {name} ({mac_address})...")
+    
     try:
-        print(f"Disconnecting {mac_address}...")
+        client = bleak.BleakClient(mac_address, timeout=5.0)
         
-        # Use system bluetoothctl to disconnect
-        process = await asyncio.create_subprocess_exec(
-            'bluetoothctl', 'disconnect', mac_address,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        # 尝试连接然后立即断开
+        await client.connect()
         
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode == 0 or b'not connected' in stderr.lower():
-            print(f"  ✓ {mac_address} disconnected")
+        if client.is_connected:
+            await client.disconnect()
+            print(f"   ✅ {name} disconnected")
             return True
         else:
-            print(f"  ✗ {mac_address} failed: {stderr.decode().strip()}")
-            return False
+            print(f"   ℹ️  {name} was not connected")
+            return True
             
+    except asyncio.TimeoutError:
+        print(f"   ℹ️  {name} not found (already disconnected)")
+        return True
     except Exception as e:
-        print(f"  ✗ {mac_address} error: {e}")
+        print(f"   ⚠️  {name} error: {e}")
         return False
 
-async def cleanup_from_config(config_file="train_detection_config.json"):
-    """Disconnect devices listed in config file"""
+
+async def cleanup_all():
+    """清理所有设备连接"""
+    print("=" * 60)
+    print("🧹 IMU Connection Cleanup Tool")
+    print("=" * 60)
+    
+    # 读取配置文件
     try:
-        with open(config_file, 'r') as f:
+        with open('witmotion_config.json', 'r') as f:
             config = json.load(f)
-        
-        devices = config.get('devices', [])
-        if not devices:
-            print("No devices found in config file")
-            return
-        
-        print(f"Found {len(devices)} devices in config")
-        print("=" * 50)
-        
-        tasks = []
-        for device in devices:
-            mac = device.get('mac')
-            if mac:
-                tasks.append(disconnect_device(mac))
-        
-        await asyncio.gather(*tasks)
-        
+            devices = config.get('devices', [])
     except FileNotFoundError:
-        print(f"Config file '{config_file}' not found")
-        print("Please run this script in the same directory as train_detection_config.json")
-        sys.exit(1)
-    except json.JSONDecodeError:
-        print(f"Error parsing config file '{config_file}'")
-        sys.exit(1)
+        print("❌ witmotion_config.json not found!")
+        print("   Please run this script in the project directory")
+        return
+    except Exception as e:
+        print(f"❌ Config error: {e}")
+        return
+    
+    if not devices:
+        print("❌ No devices in config")
+        return
+    
+    print(f"\n📋 Found {len(devices)} devices in config\n")
+    
+    # 断开所有设备
+    tasks = []
+    for dev in devices:
+        if dev.get('enabled', True):
+            task = disconnect_device(dev['mac'], dev['name'])
+            tasks.append(task)
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # 统计结果
+    success = sum(1 for r in results if r is True)
+    
+    print("\n" + "=" * 60)
+    print(f"✅ Cleanup complete: {success}/{len(tasks)} devices processed")
+    print("=" * 60)
+    print("\nYou can now run train_detector.py again")
 
-async def cleanup_all_devices():
-    """Scan and disconnect all nearby Bluetooth devices"""
-    print("Scanning for nearby Bluetooth devices...")
-    print("=" * 50)
+
+async def force_cleanup_all_ble():
+    """扫描并断开所有Witmotion设备"""
+    print("\n🔍 Scanning for Witmotion devices...")
+    
+    devices = await bleak.BleakScanner.discover(timeout=5.0)
+    
+    witmotion_devices = [
+        d for d in devices 
+        if d.name and ('WT' in d.name.upper() or 'BLE' in d.name.upper())
+    ]
+    
+    if not witmotion_devices:
+        print("   ℹ️  No Witmotion devices found")
+        return
+    
+    print(f"\n📱 Found {len(witmotion_devices)} Witmotion device(s):\n")
+    
+    for device in witmotion_devices:
+        print(f"   • {device.address} - {device.name}")
+        await disconnect_device(device.address, device.name)
+
+
+def main():
+    print("\nOptions:")
+    print("1. Disconnect devices from config file (recommended)")
+    print("2. Scan and disconnect all Witmotion devices")
+    print("3. Both")
     
     try:
-        devices = await BleakScanner.discover(timeout=5.0)
-        
-        if not devices:
-            print("No devices found")
-            return
-        
-        print(f"Found {len(devices)} devices")
-        print()
-        
-        tasks = []
-        for device in devices:
-            print(f"Found: {device.name or 'Unknown'} ({device.address})")
-            tasks.append(disconnect_device(device.address))
-        
-        print()
-        await asyncio.gather(*tasks)
-        
-    except Exception as e:
-        print(f"Scan failed: {e}")
-
-async def restart_bluetooth():
-    """Restart Bluetooth service"""
-    print("\nRestarting Bluetooth service...")
-    print("=" * 50)
+        choice = input("\nEnter choice [1-3]: ").strip()
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Cancelled")
+        return
     
     try:
-        # Stop bluetooth
-        process = await asyncio.create_subprocess_exec(
-            'sudo', 'systemctl', 'restart', 'bluetooth',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        await process.communicate()
-        
-        if process.returncode == 0:
-            print("✓ Bluetooth service restarted")
-            await asyncio.sleep(2)
-            return True
+        if choice == '1':
+            asyncio.run(cleanup_all())
+        elif choice == '2':
+            asyncio.run(force_cleanup_all_ble())
+        elif choice == '3':
+            asyncio.run(cleanup_all())
+            asyncio.run(force_cleanup_all_ble())
         else:
-            print("✗ Failed to restart Bluetooth service")
-            return False
-            
+            print("Invalid choice")
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Interrupted")
     except Exception as e:
-        print(f"✗ Error: {e}")
-        return False
+        print(f"\n❌ Error: {e}")
 
-def print_menu():
-    """Print menu options"""
-    print("\n" + "=" * 50)
-    print("Bluetooth Device Cleanup Utility")
-    print("=" * 50)
-    print("1. Disconnect devices from config file")
-    print("2. Scan and disconnect all devices")
-    print("3. Restart Bluetooth service")
-    print("4. Full cleanup (1 + 3)")
-    print("5. Exit")
-    print("=" * 50)
-
-async def main():
-    """Main cleanup routine"""
-    if len(sys.argv) > 1:
-        # Command line mode
-        option = sys.argv[1]
-        if option == "--config" or option == "-c":
-            await cleanup_from_config()
-        elif option == "--all" or option == "-a":
-            await cleanup_all_devices()
-        elif option == "--restart" or option == "-r":
-            await restart_bluetooth()
-        elif option == "--full" or option == "-f":
-            await cleanup_from_config()
-            await restart_bluetooth()
-        else:
-            print("Usage:")
-            print("  python3 cleanup.py              # Interactive menu")
-            print("  python3 cleanup.py --config     # Disconnect config devices")
-            print("  python3 cleanup.py --all        # Disconnect all devices")
-            print("  python3 cleanup.py --restart    # Restart Bluetooth")
-            print("  python3 cleanup.py --full       # Config + Restart")
-    else:
-        # Interactive mode
-        while True:
-            print_menu()
-            choice = input("Select option (1-5): ").strip()
-            
-            if choice == '1':
-                await cleanup_from_config()
-            elif choice == '2':
-                await cleanup_all_devices()
-            elif choice == '3':
-                await restart_bluetooth()
-            elif choice == '4':
-                await cleanup_from_config()
-                await restart_bluetooth()
-            elif choice == '5':
-                print("Exiting...")
-                break
-            else:
-                print("Invalid option")
-            
-            input("\nPress Enter to continue...")
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n\nInterrupted by user")
-        sys.exit(0)
+    main()

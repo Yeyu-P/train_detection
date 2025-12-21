@@ -1,0 +1,1103 @@
+#!/usr/bin/env python3
+"""
+Train Detection System - Production Stable Version with Enhancements
+Strict adherence to BlueZ engineering constraints:
+- Serial connection (no concurrency)
+- Explicit resource management
+- Complete error handling and retry
+- Unified exit path
+
+NEW Features:
+- JSON configuration for all parameters
+- Sliding window health detection with percentage trigger
+- Non-blocking upload interface for health monitoring
+- English comments and logging
+"""
+import asyncio
+import signal
+import sys
+import time
+import os
+import csv
+import json
+import sqlite3
+import logging
+import subprocess
+import aiohttp
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+from enum import Enum
+
+from witmotion_device_stable import DeviceModel, DeviceState
+
+# Global config will be loaded from JSON
+CONFIG = {}
+
+# Configure logging
+def setup_logging(log_file):
+    """Setup logging with file and console handlers"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+
+logger = logging.getLogger(__name__)
+
+
+class IMUManager:
+    """
+    Single IMU manager - independent state machine
+    Responsibilities: connection, reconnection, data reception, exception isolation, health monitoring
+    """
+    
+    def __init__(self, number, name, mac, data_callback, config):
+        self.number = number
+        self.name = name
+        self.mac = mac
+        self.data_callback = data_callback
+        self.config = config
+        
+        # Health monitoring parameters from config
+        health_config = config.get('health_monitoring', {})
+        self.DATA_TIMEOUT = health_config.get('data_timeout', 3.0)
+        self.HEALTH_CHECK_INTERVAL = health_config.get('health_check_interval', 2.0)
+        self.MAX_CONSECUTIVE_FAILURES = health_config.get('max_consecutive_failures', 3)
+        
+        # Reconnection parameters from config
+        reconnect_config = config.get('reconnection', {})
+        self.max_retries = reconnect_config.get('max_retries', 3)
+        
+        # Device instance
+        self.device = None
+        
+        # P0: Connection mutex lock (prevent race conditions)
+        self._connection_lock = asyncio.Lock()
+        
+        # State
+        self.is_ready = False
+        self.last_data_time = 0
+        self.connection_attempts = 0
+        
+        # Health monitoring
+        self.last_health_check = 0
+        self.reconnecting = False  # Prevent concurrent reconnections
+        
+        # Circular buffer
+        self.buffer = deque(maxlen=250)  # 5 seconds @ 50Hz
+        self.current_data = {}
+        
+        logger.info(f"[IMU-{self.number}] Manager initialized")
+        print(f"[IMU-{self.number}] Manager initialized")
+    
+    async def connect(self, retry_count=0):
+        """
+        Connect device (with retry and failure counting)
+        P0: Use lock protection to prevent concurrent connections
+        Returns: success (bool)
+        """
+        # P0: Check lock state, skip if already occupied
+        if self._connection_lock.locked():
+            logger.warning(f"[IMU-{self.number}] Connection already in progress, skipping")
+            return False
+        
+        async with self._connection_lock:  # P0: Mutual exclusion protection
+            if retry_count == 0:
+                self.connection_attempts += 1
+            
+            if self.connection_attempts > self.max_retries:
+                logger.error(f"[IMU-{self.number}] Max retries reached")
+                print(f"[IMU-{self.number}] Max retries reached")
+                return False
+            
+            # Create device instance
+            self.device = DeviceModel(self.name, self.mac, self._device_callback, self.config)
+            
+            # Try to connect
+            success, error_msg = await self.device.connect()
+            
+            if success:
+                self.is_ready = True
+                self.connection_attempts = 0  # Reset counter
+                self.device.reset_failure()  # Reset device failure count
+                logger.info(f"[IMU-{self.number}] Connected successfully")
+                print(f"[IMU-{self.number}] Connected successfully")
+                return True
+            else:
+                logger.error(f"[IMU-{self.number}] Connection failed: {error_msg}")
+                print(f"[IMU-{self.number}] Connection failed: {error_msg}")
+                
+                # Increment device failure count
+                if self.device:
+                    fail_count = self.device.increment_failure()
+                else:
+                    fail_count = 0
+                
+                await self.disconnect()
+                return False
+    
+    async def disconnect(self):
+        """Disconnect (complete cleanup)"""
+        self.is_ready = False
+        
+        if self.device:
+            await self.device.disconnect()
+            self.device = None
+        
+        print(f"[IMU-{self.number}] Disconnected")
+    
+    def _device_callback(self, device_model):
+        """Device data callback"""
+        current_time = time.time()
+        self.last_data_time = current_time
+        
+        data = device_model.deviceData.copy()
+        self.current_data = data
+        
+        # Add to buffer
+        self.buffer.append((current_time, data))
+        
+        # Callback to detector
+        if self.data_callback:
+            self.data_callback(self.number, current_time, data)
+    
+    def get_buffer_data(self):
+        """Get buffer data"""
+        return list(self.buffer)
+    
+    def clear_buffer(self):
+        """Clear buffer"""
+        self.buffer.clear()
+    
+    async def check_and_reconnect(self):
+        """
+        Health check + automatic reconnection
+        P0: Use lock protection to prevent competition with main connection flow
+        
+        Detection conditions:
+        - Device in READY state
+        - But no data received for DATA_TIMEOUT seconds (dead connection)
+        
+        Reconnection flow:
+        - stop_notify -> disconnect -> cleanup -> delay -> reconnect
+        - Serial execution, non-blocking for other IMUs
+        - No infinite retry after failure
+        
+        Returns: reconnected (bool)
+        """
+        current_time = time.time()
+        
+        # Prevent concurrent reconnections
+        if self.reconnecting:
+            return False
+        
+        # P0: Check connection lock, skip if other connection operations
+        if self._connection_lock.locked():
+            logger.debug(f"[IMU-{self.number}] Connection lock busy, skipping health check")
+            return False
+        
+        # Health check interval
+        if current_time - self.last_health_check < self.HEALTH_CHECK_INTERVAL:
+            return False
+        
+        self.last_health_check = current_time
+        
+        # Not READY state, don't check
+        if not self.is_ready or not self.device:
+            return False
+        
+        # Perform health check
+        is_healthy, reason = self.device.check_health(self.DATA_TIMEOUT)
+        
+        # NEW: Update sliding window
+        self.device.update_health_window(is_healthy)
+        
+        # NEW: Check sliding window
+        window_healthy, window_reason, window_stats = self.device.check_sliding_window_health()
+        
+        if is_healthy and window_healthy:
+            return False
+        
+        # Detected dead connection or sliding window failure, start reconnection flow
+        final_reason = reason if not is_healthy else window_reason
+        logger.warning(
+            f"[IMU-{self.number}] RECONNECT triggered: {final_reason}"
+        )
+        print(f"[IMU-{self.number}] Detected problem, reconnecting...")
+        
+        self.reconnecting = True
+        
+        try:
+            # P0: Use lock to protect reconnection flow
+            async with self._connection_lock:
+                # Step 1: Complete disconnect
+                logger.info(f"[IMU-{self.number}] Step 1: Disconnecting...")
+                await self.disconnect()
+                
+                # Step 2: Delay (let BLE stack stabilize)
+                await asyncio.sleep(2.0)
+                
+                # Step 3: Reconnect (lock already held, won't acquire again internally)
+                logger.info(f"[IMU-{self.number}] Step 2: Reconnecting...")
+                
+                # Temporarily call internal connection logic without acquiring lock again
+                if self.connection_attempts > self.max_retries:
+                    logger.error(f"[IMU-{self.number}] Max retries reached")
+                    return False
+                
+                self.device = DeviceModel(self.name, self.mac, self._device_callback, self.config)
+                success, error_msg = await self.device.connect()
+                
+                if success:
+                    self.is_ready = True
+                    self.connection_attempts = 0
+                    self.device.reset_failure()
+                    logger.info(f"[IMU-{self.number}] Reconnection successful")
+                    print(f"[IMU-{self.number}] Reconnected")
+                    return True
+                else:
+                    logger.error(f"[IMU-{self.number}] Reconnection failed: {error_msg}")
+                    print(f"[IMU-{self.number}] Reconnection failed")
+                    if self.device:
+                        self.device.increment_failure()
+                    await self.disconnect()
+                    return False
+                
+        except Exception as e:
+            logger.error(f"[IMU-{self.number}] Reconnection error: {e}")
+            return False
+        finally:
+            self.reconnecting = False
+    
+    def should_trigger_os_cleanup(self):
+        """
+        Determine if OS-level cleanup should be triggered
+        
+        Condition: consecutive failures >= MAX_CONSECUTIVE_FAILURES
+        """
+        if not self.device:
+            return False
+        
+        return self.device.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES
+    
+    def get_status_dict(self):
+        """
+        NEW: Get IMU status as dictionary for upload
+        
+        Returns: dict with IMU status
+        """
+        status = {
+            'number': self.number,
+            'name': self.name,
+            'mac': self.mac,
+            'is_ready': self.is_ready,
+            'reconnecting': self.reconnecting,
+            'connection_attempts': self.connection_attempts,
+            'buffer_size': len(self.buffer),
+            'current_data': self.current_data.copy() if self.current_data else {}
+        }
+        
+        # Add device health stats if available
+        if self.device:
+            status['device_health'] = self.device.get_health_stats()
+        
+        return status
+
+
+class HealthUploader:
+    """
+    NEW: Non-blocking health data uploader
+    Uploads IMU health statistics to local/LAN endpoint
+    Failures do not affect BLE operations
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        upload_config = config.get('upload', {})
+        
+        self.enabled = upload_config.get('enabled', False)
+        self.host = upload_config.get('host', 'localhost')
+        self.port = upload_config.get('port', 8080)
+        self.endpoint = upload_config.get('endpoint', '/api/imu/status')
+        self.interval = upload_config.get('interval', 30)
+        self.timeout = upload_config.get('timeout', 5.0)
+        self.retry_on_failure = upload_config.get('retry_on_failure', False)
+        
+        self.url = f"http://{self.host}:{self.port}{self.endpoint}"
+        self.last_upload_time = 0
+        self.upload_count = 0
+        self.upload_failures = 0
+        
+        if self.enabled:
+            logger.info(f"Health uploader enabled: {self.url}")
+            print(f"Health uploader enabled: {self.url}")
+    
+    async def upload_health_data(self, imu_managers, system_stats):
+        """
+        Upload health data (non-blocking)
+        
+        Args:
+            imu_managers: dict of IMU managers
+            system_stats: system statistics dict
+        
+        Returns: success (bool)
+        """
+        if not self.enabled:
+            return True
+        
+        current_time = time.time()
+        
+        # Check interval
+        if current_time - self.last_upload_time < self.interval:
+            return True
+        
+        try:
+            # Collect health data
+            health_data = {
+                'timestamp': datetime.now().isoformat(),
+                'system': system_stats,
+                'imus': []
+            }
+            
+            for num, imu in imu_managers.items():
+                health_data['imus'].append(imu.get_status_dict())
+            
+            # Upload with timeout
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.url,
+                    json=health_data,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout)
+                ) as response:
+                    if response.status == 200:
+                        self.upload_count += 1
+                        self.last_upload_time = current_time
+                        logger.debug(f"Health data uploaded successfully (count: {self.upload_count})")
+                        return True
+                    else:
+                        logger.warning(f"Upload failed with status {response.status}")
+                        self.upload_failures += 1
+                        return False
+        
+        except asyncio.TimeoutError:
+            logger.warning("Health upload timeout")
+            self.upload_failures += 1
+            return False
+        except Exception as e:
+            # Do not log at ERROR level to avoid noise
+            logger.debug(f"Health upload error: {e}")
+            self.upload_failures += 1
+            return False
+
+
+class TrainDetector:
+    """
+    Train detection system - central coordinator
+    Responsibilities:
+    - Serial connection of all IMUs
+    - Detect train passage
+    - Data recording
+    - Exception isolation
+    - Unified exit
+    - NEW: Health monitoring upload
+    """
+    
+    def __init__(self, config_file="config.json"):
+        # Load configuration
+        self.config = self._load_config_file(config_file)
+        
+        # Output configuration
+        output_config = self.config.get('output', {})
+        self.output_dir = Path(output_config.get('directory', 'train_events'))
+        self.output_dir.mkdir(exist_ok=True)
+        
+        log_file = output_config.get('log_file', 'train_detector.log')
+        setup_logging(log_file)
+        
+        # IMU managers
+        self.imus = {}  # number -> IMUManager
+        
+        # P0: Global throttling (prevent reconnection storm)
+        reconnect_config = self.config.get('reconnection', {})
+        self.last_reconnect_time = 0
+        self.reconnect_global_cooldown = reconnect_config.get('global_cooldown', 5.0)
+        
+        # OS cleanup state tracking
+        self.os_cleanup_history = {}  # mac -> last_cleanup_time
+        self.OS_CLEANUP_COOLDOWN = reconnect_config.get('os_cleanup_cooldown', 600)
+        
+        # P0: Global OS cleanup throttling
+        self.last_os_cleanup_global = 0
+        self.os_cleanup_global_cooldown = reconnect_config.get('os_cleanup_global_cooldown', 300)
+        self.ble_operations_paused = False  # BLE operations pause flag (during OS cleanup)
+        
+        # Detection parameters from config
+        detection_config = self.config.get('detection', {})
+        self.threshold = detection_config.get('threshold', 2.0)
+        self.min_duration = detection_config.get('min_duration', 1.0)
+        self.post_trigger_duration = detection_config.get('post_trigger_duration', 5.0)
+        
+        # Detection state
+        self.running = False
+        self.recording = False
+        self.trigger_time = None
+        self.trigger_device = None
+        self.event_data = {}
+        self.event_id = None
+        
+        # Database
+        db_name = output_config.get('db_name', 'events.db')
+        self.db_path = self.output_dir / db_name
+        self._init_database()
+        
+        # Statistics
+        self.stats = {
+            'total_events': 0,
+            'last_event_time': None,
+            'uptime_start': time.time(),
+            'total_reconnects': 0,
+            'total_os_cleanups': 0
+        }
+        
+        # NEW: Health uploader
+        self.health_uploader = HealthUploader(self.config)
+        
+        # Signal handlers
+        self._setup_signal_handlers()
+        
+        logger.info("=" * 60)
+        logger.info("Train Detection System - Stable Version with Enhancements")
+        logger.info("=" * 60)
+        print("=" * 60)
+        print("Train Detection System - Stable Version with Enhancements")
+        print("=" * 60)
+        print(f"Config file: {config_file}")
+        print(f"Output directory: {self.output_dir}")
+        print(f"Detection threshold: {self.threshold}g")
+        print("=" * 60)
+    
+    def _load_config_file(self, config_file):
+        """Load configuration from JSON file"""
+        if not os.path.exists(config_file):
+            logger.error(f"Config file not found: {config_file}")
+            print(f"Config file not found: {config_file}")
+            sys.exit(1)
+        
+        try:
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+                logger.info(f"Configuration loaded from {config_file}")
+                return config
+        except Exception as e:
+            logger.error(f"Config load error: {e}")
+            print(f"Config load error: {e}")
+            sys.exit(1)
+    
+    def _setup_signal_handlers(self):
+        """Setup signal handlers (unified exit path)"""
+        def signal_handler(signum, frame):
+            print(f"\nReceived signal {signum}")
+            asyncio.create_task(self.shutdown())
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+    
+    def _init_database(self):
+        """Initialize database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS events (
+                event_id TEXT PRIMARY KEY,
+                start_time REAL,
+                end_time REAL,
+                duration REAL,
+                trigger_device INTEGER,
+                max_acceleration REAL,
+                num_devices INTEGER,
+                data_path TEXT,
+                created_at TEXT
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    async def _os_level_ble_cleanup(self, mac_address):
+        """
+        OS-level BLE cleanup (extreme cases)
+        P0: Globally pause all BLE operations to prevent conflicts
+        
+        Trigger conditions:
+        - Same device consecutive failures >= MAX_CONSECUTIVE_FAILURES
+        - Time since last cleanup >= OS_CLEANUP_COOLDOWN seconds
+        
+        Operations:
+        1. Pause all BLE operations
+        2. Try bluetoothctl remove <MAC>
+        3. If failed, try hciconfig hci0 reset (more aggressive)
+        4. Cool down and resume BLE operations
+        
+        Constraints:
+        - Only triggered in extreme cases
+        - Has cooldown time
+        - Logged
+        - Not executed frequently
+        """
+        current_time = time.time()
+        
+        # Check cooldown time
+        if mac_address in self.os_cleanup_history:
+            last_cleanup = self.os_cleanup_history[mac_address]
+            elapsed = current_time - last_cleanup
+            if elapsed < self.OS_CLEANUP_COOLDOWN:
+                logger.warning(
+                    f"OS cleanup for {mac_address} skipped "
+                    f"(cooldown: {elapsed:.0f}s / {self.OS_CLEANUP_COOLDOWN}s)"
+                )
+                return False
+        
+        logger.critical(
+            f"TRIGGERING OS-LEVEL BLE CLEANUP for {mac_address}"
+        )
+        print(f"\nOS-level BLE cleanup for {mac_address}...")
+        
+        # P0: Pause all BLE operations
+        logger.warning("Pausing all BLE operations...")
+        print("Pausing all BLE operations...")
+        self.ble_operations_paused = True
+        
+        # P0: Wait for current operations to complete
+        await asyncio.sleep(2.0)
+        
+        success = False
+        
+        try:
+            # Method 1: bluetoothctl remove (safer)
+            logger.info(f"Attempting: bluetoothctl remove {mac_address}")
+            
+            result = subprocess.run(
+                ['bluetoothctl', 'remove', mac_address],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"bluetoothctl remove successful")
+                success = True
+            else:
+                logger.warning(
+                    f"bluetoothctl remove failed: {result.stderr}"
+                )
+                
+                # Method 2: hciconfig reset (more aggressive, affects all devices)
+                logger.warning("Attempting fallback: hciconfig hci0 reset")
+                
+                result = subprocess.run(
+                    ['sudo', 'hciconfig', 'hci0', 'reset'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                if result.returncode == 0:
+                    logger.info("hciconfig reset successful")
+                    success = True
+                    # P0: Longer cooldown after reset
+                    logger.info("Cooling down after hciconfig reset (10s)...")
+                    await asyncio.sleep(10.0)
+                else:
+                    logger.error(f"hciconfig reset failed: {result.stderr}")
+        
+        except subprocess.TimeoutExpired:
+            logger.error("OS cleanup command timeout")
+        except FileNotFoundError as e:
+            logger.error(f"Command not found: {e}")
+        except Exception as e:
+            logger.error(f"OS cleanup error: {e}")
+        
+        finally:
+            # P0: Always resume BLE operations
+            logger.info("Cooling down before resuming BLE operations (5s)...")
+            await asyncio.sleep(5.0)
+            
+            self.ble_operations_paused = False
+            logger.info("BLE operations resumed")
+            print("BLE operations resumed\n")
+        
+        # Record cleanup history
+        if success:
+            self.os_cleanup_history[mac_address] = current_time
+            self.stats['total_os_cleanups'] += 1
+            logger.info(
+                f"OS cleanup completed for {mac_address} "
+                f"(total: {self.stats['total_os_cleanups']})"
+            )
+            print(f"OS-level cleanup completed\n")
+        else:
+            logger.error(f"OS cleanup failed for {mac_address}")
+            print(f"OS-level cleanup failed\n")
+        
+        return success
+    
+    async def start(self):
+        """
+        Start system
+        1. Load configuration
+        2. Serial connection of all IMUs (critical!)
+        3. Start detection
+        """
+        print("\nLoading configuration...")
+        
+        config_devices = self.config.get('devices', [])
+        enabled_devices = [d for d in config_devices if d.get('enabled', True)]
+        
+        if not enabled_devices:
+            print("No devices configured")
+            return False
+        
+        print(f"Found {len(enabled_devices)} device(s) in config\n")
+        
+        # Create IMU managers
+        for dev_config in enabled_devices:
+            number = dev_config['number']
+            name = dev_config['name']
+            mac = dev_config['mac']
+            
+            imu = IMUManager(number, name, mac, self._data_callback, self.config)
+            self.imus[number] = imu
+        
+        # Serial connection of all devices (critical! No concurrency!)
+        print("=" * 60)
+        print("Connecting devices SERIALLY...")
+        print("=" * 60)
+        
+        connected_count = 0
+        for number in sorted(self.imus.keys()):
+            imu = self.imus[number]
+            
+            print(f"\n[{number}/{len(self.imus)}] Connecting {imu.name}...")
+            
+            success = await imu.connect()
+            
+            if success:
+                connected_count += 1
+                # Wait a bit after successful connection (stability)
+                await asyncio.sleep(1.0)
+            else:
+                print(f"Skipping {imu.name} (will retry later)")
+                await asyncio.sleep(0.5)
+        
+        print("\n" + "=" * 60)
+        print(f"Connection Summary: {connected_count}/{len(self.imus)} devices ready")
+        print("=" * 60)
+        
+        if connected_count == 0:
+            print("No devices connected")
+            return False
+        
+        # Start detection
+        self.running = True
+        print("\nDetection started!")
+        print(f"Monitoring {connected_count} device(s)...\n")
+        
+        return True
+    
+    async def shutdown(self):
+        """
+        Unified exit path
+        1. Stop detection
+        2. Save current recording
+        3. Serial disconnect all IMUs
+        """
+        if not self.running:
+            return
+        
+        print("\n" + "=" * 60)
+        print("Shutting down...")
+        print("=" * 60)
+        
+        self.running = False
+        
+        # Save recording in progress
+        if self.recording:
+            print("Saving current recording...")
+            self._end_recording()
+        
+        # Serial disconnect all devices
+        print("\nDisconnecting devices serially...")
+        for number in sorted(self.imus.keys()):
+            imu = self.imus[number]
+            if imu.is_ready:
+                await imu.disconnect()
+                await asyncio.sleep(0.5)  # Give system time to clean up
+        
+        print("\nShutdown complete")
+        print("=" * 60)
+    
+    def _data_callback(self, device_number, timestamp, data):
+        """IMU data callback (detection logic)"""
+        if not self.running:
+            return
+        
+        # Calculate acceleration magnitude
+        acc_x = data.get('AccX', 0)
+        acc_y = data.get('AccY', 0)
+        acc_z = data.get('AccZ', 0)
+        magnitude = (acc_x**2 + acc_y**2 + acc_z**2)**0.5
+        
+        # Detect trigger
+        if not self.recording and magnitude > self.threshold:
+            self._trigger_detection(device_number, timestamp, magnitude)
+        
+        # Record data
+        if self.recording:
+            if device_number not in self.event_data:
+                self.event_data[device_number] = []
+            self.event_data[device_number].append((timestamp, data.copy()))
+            
+            # Check if finished
+            elapsed = timestamp - self.trigger_time
+            if elapsed >= self.post_trigger_duration:
+                self._end_recording()
+    
+    def _trigger_detection(self, device_number, timestamp, magnitude):
+        """Trigger detection"""
+        self.recording = True
+        self.trigger_time = timestamp
+        self.trigger_device = device_number
+        self.event_id = datetime.fromtimestamp(timestamp).strftime('%Y%m%d_%H%M%S')
+        self.event_data = {}
+        
+        print(f"\nTRAIN DETECTED!")
+        print(f"   Device: {device_number}")
+        print(f"   Time: {datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"   Magnitude: {magnitude:.3f}g")
+        print(f"   Recording for {self.post_trigger_duration}s...")
+        
+        # Collect buffer data
+        for num, imu in self.imus.items():
+            if imu.is_ready:
+                buffer_data = imu.get_buffer_data()
+                if buffer_data:
+                    self.event_data[num] = buffer_data.copy()
+                    print(f"   Captured {len(buffer_data)} samples from IMU-{num}")
+    
+    def _end_recording(self):
+        """End recording and save"""
+        if not self.recording:
+            return
+        
+        duration = time.time() - self.trigger_time
+        print(f"\nSaving event data...")
+        print(f"   Duration: {duration:.2f}s")
+        
+        # Create event directory
+        event_dir = self.output_dir / f"event_{self.event_id}"
+        event_dir.mkdir(exist_ok=True)
+        
+        # Save data
+        max_acc = 0
+        for dev_num, data_list in self.event_data.items():
+            if not data_list:
+                continue
+            
+            csv_path = event_dir / f"device_{dev_num}.csv"
+            
+            with open(csv_path, 'w', newline='') as f:
+                fieldnames = ['timestamp', 'AccX', 'AccY', 'AccZ', 
+                            'AngX', 'AngY', 'AngZ', 'AsX', 'AsY', 'AsZ']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for ts, data in data_list:
+                    row = {
+                        'timestamp': datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f'),
+                        'AccX': data.get('AccX', ''),
+                        'AccY': data.get('AccY', ''),
+                        'AccZ': data.get('AccZ', ''),
+                        'AngX': data.get('AngX', ''),
+                        'AngY': data.get('AngY', ''),
+                        'AngZ': data.get('AngZ', ''),
+                        'AsX': data.get('AsX', ''),
+                        'AsY': data.get('AsY', ''),
+                        'AsZ': data.get('AsZ', '')
+                    }
+                    writer.writerow(row)
+                    
+                    acc = (data.get('AccX', 0)**2 + 
+                          data.get('AccY', 0)**2 + 
+                          data.get('AccZ', 0)**2)**0.5
+                    max_acc = max(max_acc, acc)
+            
+            print(f"   Saved IMU-{dev_num}: {len(data_list)} samples")
+        
+        # Save metadata
+        metadata = {
+            'event_id': self.event_id,
+            'trigger_device': self.trigger_device,
+            'trigger_time': datetime.fromtimestamp(self.trigger_time).isoformat(),
+            'duration': duration,
+            'threshold': self.threshold,
+            'max_acceleration': max_acc,
+            'num_devices': len(self.event_data),
+            'devices': list(self.event_data.keys())
+        }
+        
+        with open(event_dir / 'metadata.json', 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        # Save to database
+        self._save_to_database(metadata, str(event_dir))
+        
+        # Update statistics
+        self.stats['total_events'] += 1
+        self.stats['last_event_time'] = self.trigger_time
+        
+        print(f"   Event saved: {event_dir.name}")
+        print(f"   Max acceleration: {max_acc:.3f}g")
+        print(f"   Total events: {self.stats['total_events']}\n")
+        
+        # Reset state
+        self.recording = False
+        self.event_data = {}
+    
+    def _save_to_database(self, metadata, data_path):
+        """Save to database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                metadata['event_id'],
+                self.trigger_time,
+                self.trigger_time + metadata['duration'],
+                metadata['duration'],
+                metadata['trigger_device'],
+                metadata['max_acceleration'],
+                metadata['num_devices'],
+                data_path,
+                datetime.now().isoformat()
+            ))
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"   Database error: {e}")
+    
+    def print_status(self):
+        """Print status"""
+        uptime = time.time() - self.stats['uptime_start']
+        
+        logger.info("=" * 60)
+        logger.info("SYSTEM STATUS")
+        logger.info(f"Uptime: {uptime/3600:.1f}h | Events: {self.stats['total_events']} | "
+                   f"Reconnects: {self.stats['total_reconnects']} | "
+                   f"OS Cleanups: {self.stats['total_os_cleanups']}")
+        
+        print("\n" + "=" * 60)
+        print("SYSTEM STATUS")
+        print("=" * 60)
+        print(f"Uptime: {uptime/3600:.1f} hours")
+        print(f"Total Events: {self.stats['total_events']}")
+        print(f"Reconnects: {self.stats['total_reconnects']}")
+        print(f"OS Cleanups: {self.stats['total_os_cleanups']}")
+        
+        if self.health_uploader.enabled:
+            print(f"Upload Count: {self.health_uploader.upload_count}")
+            print(f"Upload Failures: {self.health_uploader.upload_failures}")
+        
+        if self.stats['last_event_time']:
+            last = datetime.fromtimestamp(self.stats['last_event_time'])
+            print(f"Last Event: {last.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        print(f"\nIMUs: {len(self.imus)}")
+        for num in sorted(self.imus.keys()):
+            imu = self.imus[num]
+            status = "READY" if imu.is_ready else "DISCONNECTED"
+            buffer = len(imu.buffer)
+            
+            # Display health status
+            health_info = ""
+            if imu.is_ready and imu.device:
+                is_healthy, _ = imu.device.check_health(imu.DATA_TIMEOUT)
+                window_healthy, _, window_stats = imu.device.check_sliding_window_health()
+                
+                if not is_healthy or not window_healthy:
+                    health_info = " UNHEALTHY"
+                
+                if imu.device.consecutive_failures > 0:
+                    health_info += f" (failures: {imu.device.consecutive_failures})"
+                
+                # Show sliding window stats
+                if window_stats:
+                    health_info += f" (window: {window_stats.get('unhealthy_percentage', 0):.0f}%)"
+            
+            print(f"  IMU-{num}: {status} (Buffer: {buffer}){health_info}")
+            
+            if imu.current_data:
+                acc = imu.current_data
+                # Display last data time
+                if imu.device and imu.device.last_data_time > 0:
+                    elapsed = time.time() - imu.device.last_data_time
+                    time_info = f" (last data: {elapsed:.1f}s ago)"
+                else:
+                    time_info = ""
+                
+                print(f"    Acc: X={acc.get('AccX', 0):6.3f}g "
+                      f"Y={acc.get('AccY', 0):6.3f}g "
+                      f"Z={acc.get('AccZ', 0):6.3f}g{time_info}")
+        
+        print("=" * 60 + "\n")
+    
+    async def run(self):
+        """
+        Main run loop
+        - Periodically print status
+        - Monitor device health, automatic reconnection
+        - Trigger OS cleanup (extreme cases)
+        - NEW: Upload health data
+        - P0: Global throttling to prevent reconnection storm
+        """
+        logger.info("System running, press Ctrl+C to stop")
+        print("Press Ctrl+C to stop\n")
+        
+        status_interval = self.config.get('status_report_interval', 30)
+        last_status = time.time()
+        health_check_interval = 2  # Check every 2 seconds
+        last_health_check = time.time()
+        
+        try:
+            while self.running:
+                await asyncio.sleep(1)
+                
+                current_time = time.time()
+                
+                # Periodically print status
+                if current_time - last_status >= status_interval:
+                    self.print_status()
+                    last_status = current_time
+                    
+                    # NEW: Upload health data
+                    try:
+                        await self.health_uploader.upload_health_data(
+                            self.imus,
+                            self.stats
+                        )
+                    except Exception as e:
+                        # Do not let upload errors affect main loop
+                        logger.debug(f"Health upload exception: {e}")
+                
+                # P0: If BLE operations are paused, skip all checks
+                if self.ble_operations_paused:
+                    continue
+                
+                # Health monitoring + automatic reconnection
+                if current_time - last_health_check >= health_check_interval:
+                    last_health_check = current_time
+                    
+                    for num, imu in self.imus.items():
+                        if not imu.is_ready:
+                            continue
+                        
+                        # P0: Global reconnection throttling check
+                        time_since_last_reconnect = current_time - self.last_reconnect_time
+                        if time_since_last_reconnect < self.reconnect_global_cooldown:
+                            # Too fast, skip this device
+                            logger.debug(
+                                f"[IMU-{num}] Skipping check (global cooldown: "
+                                f"{time_since_last_reconnect:.1f}s / {self.reconnect_global_cooldown}s)"
+                            )
+                            continue
+                        
+                        # Health check + reconnect
+                        reconnected = await imu.check_and_reconnect()
+                        
+                        if reconnected:
+                            # P0: Update global reconnect time
+                            self.last_reconnect_time = current_time
+                            self.stats['total_reconnects'] += 1
+                            logger.info(
+                                f"Total reconnects: {self.stats['total_reconnects']}"
+                            )
+                        
+                        # Check if OS cleanup is needed
+                        if imu.should_trigger_os_cleanup():
+                            # P0: Global OS cleanup throttling check
+                            time_since_last_os_cleanup = current_time - self.last_os_cleanup_global
+                            if time_since_last_os_cleanup < self.os_cleanup_global_cooldown:
+                                logger.warning(
+                                    f"[IMU-{num}] OS cleanup requested but in GLOBAL cooldown "
+                                    f"({time_since_last_os_cleanup:.0f}s / {self.os_cleanup_global_cooldown}s)"
+                                )
+                                continue
+                            
+                            logger.critical(
+                                f"[IMU-{num}] Consecutive failures threshold reached, "
+                                f"triggering OS cleanup"
+                            )
+                            
+                            # Execute OS cleanup (automatically pauses all BLE operations)
+                            cleanup_success = await self._os_level_ble_cleanup(imu.mac)
+                            
+                            # P0: Update global OS cleanup time
+                            self.last_os_cleanup_global = current_time
+                            
+                            if cleanup_success:
+                                # Reset device failure count
+                                if imu.device:
+                                    imu.device.consecutive_failures = 0
+                                
+                                # Wait for system to stabilize then try to reconnect
+                                await asyncio.sleep(3.0)
+                                
+                                logger.info(f"[IMU-{num}] Attempting reconnect after OS cleanup...")
+                                await imu.connect()
+                            
+                            # P0: Forced wait after OS cleanup, don't check other devices
+                            break
+                
+        except asyncio.CancelledError:
+            logger.warning("Run loop cancelled")
+            print("\nRun loop cancelled")
+        finally:
+            await self.shutdown()
+
+
+async def main():
+    """Main function"""
+    # Check for config file argument
+    config_file = "config.json"
+    if len(sys.argv) > 1:
+        config_file = sys.argv[1]
+    
+    detector = TrainDetector(config_file=config_file)
+    
+    # Start
+    success = await detector.start()
+    
+    if not success:
+        print("Failed to start")
+        return
+    
+    # Run
+    await detector.run()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n\nInterrupted")
+    except Exception as e:
+        print(f"\nFatal error: {e}")
+        import traceback
+        traceback.print_exc()

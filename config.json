@@ -26,35 +26,41 @@
     }
   ],
   "detection": {
-    "threshold_g": 2.0,
-    "min_duration_seconds": 1.0,
-    "post_trigger_duration_seconds": 5.0,
-    "buffer_max_seconds": 5,
-    "sample_rate_hz": 50
+    "threshold": 2.0,
+    "min_duration": 1.0,
+    "post_trigger_duration": 5.0
   },
-  "health_check": {
+  "health_monitoring": {
+    "data_timeout": 3.0,
+    "health_check_interval": 2.0,
+    "max_consecutive_failures": 3,
     "sliding_window_size": 50,
-    "threshold_percentage": 70,
-    "health_check_threshold_g": 15.0,
-    "health_check_interval_seconds": 5
+    "trigger_percentage": 70.0
+  },
+  "reconnection": {
+    "max_retries": 3,
+    "global_cooldown": 5.0,
+    "os_cleanup_cooldown": 600,
+    "os_cleanup_global_cooldown": 300
+  },
+  "timeouts": {
+    "connect_timeout": 15.0,
+    "gatt_timeout": 10.0,
+    "first_data_timeout": 5.0
   },
   "upload": {
     "enabled": true,
-    "protocol": "http",
     "host": "localhost",
     "port": 8080,
     "endpoint": "/api/imu/status",
-    "upload_interval_seconds": 30,
-    "timeout_seconds": 5,
+    "interval": 30,
+    "timeout": 5.0,
     "retry_on_failure": false
-  },
-  "logging": {
-    "log_file": "detector.log",
-    "log_level": "INFO",
-    "console_output": true
   },
   "output": {
     "directory": "train_events",
-    "database_name": "events.db"
-  }
+    "db_name": "events.db",
+    "log_file": "train_detector.log"
+  },
+  "status_report_interval": 30
 }

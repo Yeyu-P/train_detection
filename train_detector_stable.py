@@ -466,6 +466,9 @@ class TrainDetector:
         # NEW: Health uploader
         self.health_uploader = HealthUploader(self.config)
         
+        # NEW: Save operation lock (prevent race conditions)
+        self._save_lock = asyncio.Lock()
+        
         # Signal handlers
         self._setup_signal_handlers()
         
@@ -507,23 +510,54 @@ class TrainDetector:
         signal.signal(signal.SIGTERM, signal_handler)
     
     def _init_database(self):
-        """Initialize database"""
+        """Initialize database with migration support"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS events (
-                event_id TEXT PRIMARY KEY,
-                start_time REAL,
-                end_time REAL,
-                duration REAL,
-                trigger_device INTEGER,
-                max_acceleration REAL,
-                num_devices INTEGER,
-                data_path TEXT,
-                created_at TEXT
-            )
-        ''')
+        # Check if table exists
+        cursor.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name='events'
+        """)
+        
+        table_exists = cursor.fetchone() is not None
+        
+        if table_exists:
+            # Check column count to detect schema mismatch
+            cursor.execute("PRAGMA table_info(events)")
+            columns = cursor.fetchall()
+            
+            if len(columns) != 9:
+                logger.warning(f"Database schema mismatch: found {len(columns)} columns, expected 9")
+                logger.warning("Backing up old table and creating new one")
+                
+                # Backup old table
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                try:
+                    cursor.execute(f"ALTER TABLE events RENAME TO events_backup_{timestamp}")
+                    logger.info(f"Old table renamed to events_backup_{timestamp}")
+                    table_exists = False
+                except sqlite3.Error as e:
+                    logger.error(f"Failed to backup old table: {e}")
+                    print(f"ERROR: Database schema mismatch. Please delete {self.db_path} and restart.")
+                    conn.close()
+                    return
+        
+        if not table_exists:
+            cursor.execute('''
+                CREATE TABLE events (
+                    event_id TEXT PRIMARY KEY,
+                    start_time REAL,
+                    end_time REAL,
+                    duration REAL,
+                    trigger_device INTEGER,
+                    max_acceleration REAL,
+                    num_devices INTEGER,
+                    data_path TEXT,
+                    created_at TEXT
+                )
+            ''')
+            logger.info("Events table created successfully")
         
         conn.commit()
         conn.close()
@@ -728,7 +762,7 @@ class TrainDetector:
         # Save recording in progress
         if self.recording:
             print("Saving current recording...")
-            self._end_recording()
+            await self._end_recording()
         
         # Serial disconnect all devices
         print("\nDisconnecting devices serially...")
@@ -765,10 +799,16 @@ class TrainDetector:
             # Check if finished
             elapsed = timestamp - self.trigger_time
             if elapsed >= self.post_trigger_duration:
-                self._end_recording()
+                # Schedule async save without blocking
+                asyncio.create_task(self._end_recording())
     
     def _trigger_detection(self, device_number, timestamp, magnitude):
         """Trigger detection"""
+        # Prevent triggering if already recording (avoid data overwrite)
+        if self.recording:
+            logger.warning(f"Skipping trigger from IMU-{device_number}: already recording")
+            return
+        
         self.recording = True
         self.trigger_time = timestamp
         self.trigger_device = device_number
@@ -789,54 +829,160 @@ class TrainDetector:
                     self.event_data[num] = buffer_data.copy()
                     print(f"   Captured {len(buffer_data)} samples from IMU-{num}")
     
-    def _end_recording(self):
-        """End recording and save"""
-        if not self.recording:
-            return
-        
-        duration = time.time() - self.trigger_time
-        print(f"\nSaving event data...")
-        print(f"   Duration: {duration:.2f}s")
-        
-        # Create event directory
-        event_dir = self.output_dir / f"event_{self.event_id}"
-        event_dir.mkdir(exist_ok=True)
-        
-        # Save data
-        max_acc = 0
-        for dev_num, data_list in self.event_data.items():
-            if not data_list:
-                continue
+    async def _end_recording(self):
+        """
+        End recording and save (async to prevent blocking)
+        Uses executor for file I/O to avoid blocking event loop
+        Protected by lock to prevent race conditions
+        """
+        # Use lock to prevent concurrent save operations
+        async with self._save_lock:
+            if not self.recording:
+                return
             
-            csv_path = event_dir / f"device_{dev_num}.csv"
+            # Mark as not recording immediately to allow new detections
+            self.recording = False
             
-            with open(csv_path, 'w', newline='') as f:
-                fieldnames = ['timestamp', 'AccX', 'AccY', 'AccZ', 
-                            'AngX', 'AngY', 'AngZ', 'AsX', 'AsY', 'AsZ']
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
+            duration = time.time() - self.trigger_time
+            print(f"\nSaving event data...")
+            print(f"   Duration: {duration:.2f}s")
+            
+            # Copy data to avoid race conditions
+            event_id = self.event_id
+            trigger_device = self.trigger_device
+            trigger_time = self.trigger_time
+            event_data_copy = {k: list(v) for k, v in self.event_data.items()}
+            
+            # Clear event data immediately
+            self.event_data = {}
+            
+            # Save in executor to avoid blocking (with error handling)
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    self._save_event_data_sync,
+                    event_id,
+                    trigger_device,
+                    trigger_time,
+                    duration,
+                    event_data_copy
+                )
+            except Exception as e:
+                logger.error(f"Background save error: {e}")
+                print(f"   Background save failed: {e}")
+                return
+            
+            # Update statistics
+            self.stats['total_events'] += 1
+            self.stats['last_event_time'] = trigger_time
+    
+    def _save_event_data_sync(self, event_id, trigger_device, trigger_time, duration, event_data_copy):
+        """
+        Synchronous file I/O (runs in executor)
+        This prevents blocking the async event loop
+        Includes robust error handling and disk space check
+        """
+        try:
+            # Check available disk space
+            try:
+                stat = os.statvfs(self.output_dir)
+                available_mb = (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
                 
-                for ts, data in data_list:
-                    row = {
-                        'timestamp': datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f'),
-                        'AccX': data.get('AccX', ''),
-                        'AccY': data.get('AccY', ''),
-                        'AccZ': data.get('AccZ', ''),
-                        'AngX': data.get('AngX', ''),
-                        'AngY': data.get('AngY', ''),
-                        'AngZ': data.get('AngZ', ''),
-                        'AsX': data.get('AsX', ''),
-                        'AsY': data.get('AsY', ''),
-                        'AsZ': data.get('AsZ', '')
-                    }
-                    writer.writerow(row)
-                    
-                    acc = (data.get('AccX', 0)**2 + 
-                          data.get('AccY', 0)**2 + 
-                          data.get('AccZ', 0)**2)**0.5
-                    max_acc = max(max_acc, acc)
+                if available_mb < 100:  # Less than 100MB
+                    logger.warning(f"Low disk space: {available_mb:.1f}MB available")
+                    print(f"   WARNING: Low disk space ({available_mb:.1f}MB), save may fail")
+            except Exception as e:
+                logger.warning(f"Could not check disk space: {e}")
             
-            print(f"   Saved IMU-{dev_num}: {len(data_list)} samples")
+            # Create event directory
+            event_dir = self.output_dir / f"event_{event_id}"
+            try:
+                event_dir.mkdir(exist_ok=True, parents=True)
+            except OSError as e:
+                logger.error(f"Failed to create event directory: {e}")
+                print(f"   ERROR: Could not create directory: {e}")
+                return
+            
+            # Save data files
+            max_acc = 0
+            saved_files = []
+            
+            for dev_num, data_list in event_data_copy.items():
+                if not data_list:
+                    continue
+                
+                csv_path = event_dir / f"device_{dev_num}.csv"
+                
+                try:
+                    with open(csv_path, 'w', newline='') as f:
+                        fieldnames = ['timestamp', 'AccX', 'AccY', 'AccZ', 
+                                    'AngX', 'AngY', 'AngZ', 'AsX', 'AsY', 'AsZ']
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        
+                        for ts, data in data_list:
+                            row = {
+                                'timestamp': datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f'),
+                                'AccX': data.get('AccX', ''),
+                                'AccY': data.get('AccY', ''),
+                                'AccZ': data.get('AccZ', ''),
+                                'AngX': data.get('AngX', ''),
+                                'AngY': data.get('AngY', ''),
+                                'AngZ': data.get('AngZ', ''),
+                                'AsX': data.get('AsX', ''),
+                                'AsY': data.get('AsY', ''),
+                                'AsZ': data.get('AsZ', '')
+                            }
+                            writer.writerow(row)
+                            
+                            acc = (data.get('AccX', 0)**2 + 
+                                  data.get('AccY', 0)**2 + 
+                                  data.get('AccZ', 0)**2)**0.5
+                            max_acc = max(max_acc, acc)
+                    
+                    saved_files.append(dev_num)
+                    print(f"   Saved IMU-{dev_num}: {len(data_list)} samples")
+                    
+                except IOError as e:
+                    logger.error(f"Failed to save IMU-{dev_num} data: {e}")
+                    print(f"   ERROR: Could not save IMU-{dev_num}: {e}")
+                    continue
+            
+            if not saved_files:
+                logger.error("No data files saved successfully!")
+                print(f"   ERROR: Failed to save any data files")
+                return
+            
+            # Save metadata
+            metadata = {
+                'event_id': event_id,
+                'trigger_device': trigger_device,
+                'trigger_time': datetime.fromtimestamp(trigger_time).isoformat(),
+                'duration': duration,
+                'threshold': self.threshold,
+                'max_acceleration': max_acc,
+                'num_devices': len(event_data_copy),
+                'devices': list(event_data_copy.keys())
+            }
+            
+            try:
+                with open(event_dir / 'metadata.json', 'w') as f:
+                    json.dump(metadata, f, indent=2)
+            except IOError as e:
+                logger.error(f"Failed to save metadata: {e}")
+                print(f"   ERROR: Could not save metadata: {e}")
+            
+            # Save to database
+            self._save_to_database(metadata, str(event_dir), trigger_time)
+            
+            print(f"   Event saved: {event_dir.name}")
+            print(f"   Max acceleration: {max_acc:.3f}g")
+            print(f"   Total events: {self.stats['total_events']}\n")
+            
+        except Exception as e:
+            logger.error(f"Error saving event data: {e}")
+            print(f"   ERROR saving event: {e}\n")
         
         # Save metadata
         metadata = {
@@ -868,18 +1014,22 @@ class TrainDetector:
         self.recording = False
         self.event_data = {}
     
-    def _save_to_database(self, metadata, data_path):
-        """Save to database"""
+    def _save_to_database(self, metadata, data_path, trigger_time):
+        """Save to database with explicit column names"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
+            # Use explicit column names to avoid schema mismatch issues
             cursor.execute('''
-                INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO events 
+                (event_id, start_time, end_time, duration, trigger_device, 
+                 max_acceleration, num_devices, data_path, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 metadata['event_id'],
-                self.trigger_time,
-                self.trigger_time + metadata['duration'],
+                trigger_time,
+                trigger_time + metadata['duration'],
                 metadata['duration'],
                 metadata['trigger_device'],
                 metadata['max_acceleration'],
@@ -891,7 +1041,9 @@ class TrainDetector:
             conn.commit()
             conn.close()
         except Exception as e:
+            logger.error(f"Database error: {e}")
             print(f"   Database error: {e}")
+            print(f"   TIP: If schema mismatch, delete {self.db_path} and restart")
     
     def print_status(self):
         """Print status"""

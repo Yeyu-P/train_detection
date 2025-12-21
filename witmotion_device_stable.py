@@ -171,6 +171,7 @@ class DeviceModel:
             
             self.state = DeviceState.READY
             self.consecutive_failures = 0
+            self.health_window.clear()  # Clear old health data on reconnection
             logger.info(f"[{self.deviceName}] READY (data flowing)")
             print(f"[{self.deviceName}] READY (data flowing)")
             return True, "Connected successfully"

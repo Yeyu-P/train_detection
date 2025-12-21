@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-简单的数据接收服务器
-用于接收train_detector上传的数据
+Example upload endpoint server
+Simple Flask server to receive IMU health status uploads
 """
 from flask import Flask, request, jsonify
 from datetime import datetime
@@ -9,112 +9,90 @@ import json
 
 app = Flask(__name__)
 
-# 存储接收到的数据
+# Store received data in memory (for demonstration)
 received_data = []
 
-@app.route('/api/data', methods=['POST'])
-def receive_data():
-    """接收上传的数据"""
+
+@app.route('/api/imu/status', methods=['POST'])
+def receive_status():
+    """Receive IMU health status"""
     try:
-        data = request.get_json()
+        data = request.json
         
-        # 打印接收到的数据
-        print("\n" + "="*60)
-        print(f"📥 Received data at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("="*60)
+        # Log receipt
+        timestamp = data.get('timestamp', datetime.now().isoformat())
+        devices = data.get('devices', [])
         
-        # 打印设备状态
-        if 'devices' in data:
-            print(f"\n📱 Devices: {len(data['devices'])}")
-            for device in data['devices']:
-                print(f"\n  Device {device['number']}: {device['name']}")
-                if 'sliding_window' in device:
-                    sw = device['sliding_window']
-                    status = "✅ Healthy" if sw.get('healthy', True) else "⚠️ Alert"
-                    print(f"    Sliding Window: {status}")
-                    print(f"    Percentage: {sw.get('percentage', 0):.1f}%")
-                    print(f"    Exceeded: {sw.get('exceeded_count', 0)}/{sw.get('window_size', 0)}")
+        print(f"\n[{timestamp}] Received status from {len(devices)} devices")
         
-        # 打印统计信息
-        if 'stats' in data:
-            print(f"\n📊 Stats:")
-            print(f"  Total Events: {data['stats'].get('total_events', 0)}")
+        # Print device summaries
+        for device in devices:
+            print(f"  Device {device['device_number']} ({device['device_name']}):")
+            print(f"    Connected: {device['connected']}")
+            print(f"    Health: {device['exceeded_percentage']:.1f}% exceeded")
+            print(f"    Total checks: {device['total_checks']}")
         
-        print("\n" + "="*60)
-        
-        # 保存到列表
+        # Store data
         received_data.append({
             'received_at': datetime.now().isoformat(),
-            'data': data
+            'payload': data
         })
         
-        # 保存到文件（可选）
-        with open('received_data.json', 'w') as f:
-            json.dump(received_data, f, indent=2)
+        # Keep only last 100 entries
+        if len(received_data) > 100:
+            received_data.pop(0)
         
-        return jsonify({'status': 'success', 'message': 'Data received'}), 200
+        return jsonify({
+            "status": "ok",
+            "message": "Data received successfully",
+            "devices_count": len(devices)
+        }), 200
         
     except Exception as e:
-        print(f"❌ Error receiving data: {e}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        print(f"Error processing request: {e}")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 400
 
 
-@app.route('/api/data', methods=['GET'])
-def get_data():
-    """查看接收到的数据"""
+@app.route('/api/imu/history', methods=['GET'])
+def get_history():
+    """Get upload history"""
     return jsonify({
-        'total_uploads': len(received_data),
-        'data': received_data[-10:]  # 返回最近10条
-    })
+        "total_uploads": len(received_data),
+        "history": received_data[-10:]  # Last 10 entries
+    }), 200
 
 
-@app.route('/api/health', methods=['GET'])
+@app.route('/health', methods=['GET'])
 def health_check():
-    """健康检查"""
+    """Health check endpoint"""
     return jsonify({
-        'status': 'running',
-        'total_received': len(received_data),
-        'last_received': received_data[-1]['received_at'] if received_data else None
-    })
+        "status": "healthy",
+        "uptime": "running",
+        "total_uploads": len(received_data)
+    }), 200
 
 
-@app.route('/', methods=['GET'])
-def index():
-    """首页"""
-    return f"""
-    <html>
-    <head><title>Data Receiver</title></head>
-    <body>
-        <h1>🚂 Train Detector Data Receiver</h1>
-        <p>Server is running!</p>
-        <p>Total uploads received: {len(received_data)}</p>
-        <p>Last upload: {received_data[-1]['received_at'] if received_data else 'None'}</p>
-        <hr>
-        <h2>API Endpoints:</h2>
-        <ul>
-            <li>POST /api/data - Receive data</li>
-            <li>GET /api/data - View received data</li>
-            <li>GET /api/health - Health check</li>
-        </ul>
-        <hr>
-        <h2>Recent Uploads:</h2>
-        <pre>{json.dumps(received_data[-5:], indent=2)}</pre>
-    </body>
-    </html>
-    """
+def main():
+    """Run the server"""
+    print("=" * 60)
+    print("IMU Status Upload Server")
+    print("=" * 60)
+    print("Endpoints:")
+    print("  POST /api/imu/status   - Receive IMU status")
+    print("  GET  /api/imu/history  - View upload history")
+    print("  GET  /health           - Health check")
+    print("=" * 60)
+    print("\nStarting server on http://0.0.0.0:8080")
+    print("Press Ctrl+C to stop\n")
+    
+    try:
+        app.run(host='0.0.0.0', port=8080, debug=False)
+    except KeyboardInterrupt:
+        print("\nServer stopped")
 
 
 if __name__ == '__main__':
-    print("\n" + "="*60)
-    print("🚀 Starting Data Receiver Server")
-    print("="*60)
-    print("📡 Listening on: http://localhost:8000")
-    print("📥 Upload endpoint: http://localhost:8000/api/data")
-    print("📊 View data: http://localhost:8000/api/data")
-    print("💚 Health check: http://localhost:8000/api/health")
-    print("🌐 Web interface: http://localhost:8000")
-    print("="*60)
-    print("\nPress Ctrl+C to stop\n")
-    
-    # 启动服务器
-    app.run(host='0.0.0.0', port=8000, debug=False)
+    main()

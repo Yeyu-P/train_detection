@@ -34,6 +34,24 @@ from witmotion_device_stable import DeviceModel, DeviceState
 # Global config will be loaded from JSON
 CONFIG = {}
 
+# ====================================================================
+# NEW CONSTANTS FOR Z-AXIS DETECTION AND CALIBRATION
+# ====================================================================
+# Maximum recording duration (seconds) - hard limit to force stop
+MAX_RECORD_SECONDS = 60  # Can be overridden by config
+
+# Z-axis stop threshold (g) - recording stops when ALL devices below this
+STOP_THRESHOLD_Z = 0.5  # Can be overridden by config
+
+# Calibration parameters
+CALIBRATION_INTERVAL_HOURS = 6  # Auto-calibrate every N hours
+CALIBRATION_SAMPLES = 100  # Number of samples to average for calibration
+CALIBRATION_DURATION = 2.0  # Duration (seconds) to collect calibration samples
+CALIBRATION_VIBRATION_THRESHOLD = 0.3  # If Z-axis variance exceeds this, skip calibration
+
+# Stop condition window size (samples per device)
+STOP_WINDOW_SIZE = 50  # Sliding window for checking stop condition
+
 # Configure logging
 def setup_logging(log_file):
     """Setup logging with file and console handlers"""
@@ -440,7 +458,11 @@ class TrainDetector:
         self.threshold = detection_config.get('threshold', 2.0)
         self.min_duration = detection_config.get('min_duration', 1.0)
         self.post_trigger_duration = detection_config.get('post_trigger_duration', 5.0)
-        
+
+        # NEW: Z-axis specific parameters
+        self.max_record_seconds = detection_config.get('max_record_seconds', MAX_RECORD_SECONDS)
+        self.stop_threshold_z = detection_config.get('stop_threshold_z', STOP_THRESHOLD_Z)
+
         # Detection state
         self.running = False
         self.recording = False
@@ -448,6 +470,20 @@ class TrainDetector:
         self.trigger_device = None
         self.event_data = {}
         self.event_id = None
+
+        # NEW: Calibration state
+        calibration_config = self.config.get('calibration', {})
+        self.calibration_interval_hours = calibration_config.get('interval_hours', CALIBRATION_INTERVAL_HOURS)
+        self.calibration_samples = calibration_config.get('samples', CALIBRATION_SAMPLES)
+        self.calibration_duration = calibration_config.get('duration', CALIBRATION_DURATION)
+        self.calibration_vibration_threshold = calibration_config.get('vibration_threshold', CALIBRATION_VIBRATION_THRESHOLD)
+        self.z_axis_offset = {}  # device_number -> calibration offset
+        self.last_calibration_time = 0
+        self.calibrating = False  # Flag to prevent concurrent calibration
+
+        # NEW: Sliding window for Z-axis stop condition (per device)
+        self.stop_window_size = detection_config.get('stop_window_size', STOP_WINDOW_SIZE)
+        self.z_stop_windows = {}  # device_number -> deque of Z-axis values
         
         # Database
         db_name = output_config.get('db_name', 'events.db')
@@ -740,9 +776,134 @@ class TrainDetector:
         self.running = True
         print("\nDetection started!")
         print(f"Monitoring {connected_count} device(s)...\n")
-        
+
+        # NEW: Perform initial calibration
+        await self._perform_calibration()
+
         return True
-    
+
+    async def _perform_calibration(self):
+        """
+        NEW: Perform Z-axis calibration for all connected devices
+
+        Calibration process:
+        1. Check for vibration - skip if detected
+        2. Collect Z-axis samples for CALIBRATION_DURATION
+        3. Calculate average Z-axis offset
+        4. Store offset for runtime subtraction
+
+        Safety: Only calibrates when no vibration is detected
+        """
+        if self.calibrating:
+            logger.warning("Calibration already in progress, skipping")
+            return
+
+        self.calibrating = True
+        current_time = time.time()
+
+        try:
+            print("\n" + "=" * 60)
+            print("Z-AXIS CALIBRATION")
+            print("=" * 60)
+            logger.info("Starting Z-axis calibration")
+
+            # Step 1: Collect samples from all devices to check for vibration
+            print("Checking for vibration before calibration...")
+            vibration_check_samples = {}
+
+            for num, imu in self.imus.items():
+                if imu.is_ready:
+                    vibration_check_samples[num] = []
+
+            # Collect 1 second of samples to check for vibration
+            start_time = time.time()
+            while time.time() - start_time < 1.0:
+                for num in vibration_check_samples.keys():
+                    imu = self.imus[num]
+                    if imu.current_data:
+                        z_val = imu.current_data.get('AccZ', 0)
+                        vibration_check_samples[num].append(z_val)
+                await asyncio.sleep(0.02)  # 50Hz sampling
+
+            # Check variance - if too high, skip calibration
+            for num, samples in vibration_check_samples.items():
+                if len(samples) < 10:
+                    print(f"  IMU-{num}: Not enough samples, skipping calibration")
+                    logger.warning(f"IMU-{num} calibration skipped: insufficient samples")
+                    self.calibrating = False
+                    return
+
+                # Calculate variance
+                mean_z = sum(samples) / len(samples)
+                variance = sum((x - mean_z) ** 2 for x in samples) / len(samples)
+                std_dev = variance ** 0.5
+
+                if std_dev > self.calibration_vibration_threshold:
+                    print(f"  Vibration detected (std: {std_dev:.3f}g), postponing calibration")
+                    logger.warning(f"Calibration postponed: vibration detected (std: {std_dev:.3f}g)")
+                    self.calibrating = False
+                    return
+
+            print("  No vibration detected, proceeding with calibration")
+
+            # Step 2: Collect calibration samples
+            print(f"Collecting {self.calibration_samples} samples from each device...")
+            calibration_samples = {}
+
+            for num, imu in self.imus.items():
+                if imu.is_ready:
+                    calibration_samples[num] = []
+
+            # Collect samples for CALIBRATION_DURATION
+            start_time = time.time()
+            sample_count = 0
+            while sample_count < self.calibration_samples:
+                for num in calibration_samples.keys():
+                    imu = self.imus[num]
+                    if imu.current_data and len(calibration_samples[num]) < self.calibration_samples:
+                        z_val = imu.current_data.get('AccZ', 0)
+                        calibration_samples[num].append(z_val)
+
+                # Check if all devices have enough samples
+                if all(len(samples) >= self.calibration_samples for samples in calibration_samples.values()):
+                    break
+
+                await asyncio.sleep(0.02)  # 50Hz sampling
+
+                # Timeout check
+                if time.time() - start_time > self.calibration_duration * 2:
+                    print("  Calibration timeout, using available samples")
+                    break
+
+            # Step 3: Calculate offsets
+            for num, samples in calibration_samples.items():
+                if len(samples) == 0:
+                    logger.warning(f"IMU-{num}: No calibration samples, using offset 0")
+                    self.z_axis_offset[num] = 0.0
+                    continue
+
+                # Calculate average Z-axis offset
+                offset = sum(samples) / len(samples)
+                self.z_axis_offset[num] = offset
+
+                print(f"  IMU-{num}: Offset = {offset:.3f}g (from {len(samples)} samples)")
+                logger.info(f"IMU-{num} Z-axis offset: {offset:.3f}g")
+
+            # Initialize stop windows for all devices
+            for num in self.imus.keys():
+                self.z_stop_windows[num] = deque(maxlen=self.stop_window_size)
+
+            self.last_calibration_time = current_time
+            print("Calibration complete!")
+            print("=" * 60 + "\n")
+            logger.info("Z-axis calibration completed successfully")
+
+        except Exception as e:
+            logger.error(f"Calibration error: {e}")
+            print(f"Calibration error: {e}")
+        finally:
+            self.calibrating = False
+
     async def shutdown(self):
         """
         Unified exit path
@@ -776,63 +937,136 @@ class TrainDetector:
         print("=" * 60)
     
     def _data_callback(self, device_number, timestamp, data):
-        """IMU data callback (detection logic)"""
+        """
+        IMU data callback (detection logic)
+
+        NEW BEHAVIOR:
+        - Uses ONLY Z-axis for detection (with calibration offset)
+        - Global trigger: ANY device detection starts ALL devices recording
+        - During recording: stop vibration detection, only check stop conditions
+        - Stop conditions: ALL devices Z-axis below threshold + max duration check
+        """
         if not self.running:
             return
-        
-        # Calculate acceleration magnitude
-        acc_x = data.get('AccX', 0)
-        acc_y = data.get('AccY', 0)
-        acc_z = data.get('AccZ', 0)
-        magnitude = (acc_x**2 + acc_y**2 + acc_z**2)**0.5
-        
-        # Detect trigger
-        if not self.recording and magnitude > self.threshold:
-            self._trigger_detection(device_number, timestamp, magnitude)
-        
-        # Record data
-        if self.recording:
+
+        # Get Z-axis value and apply calibration offset
+        acc_z_raw = data.get('AccZ', 0)
+        offset = self.z_axis_offset.get(device_number, 0.0)
+        acc_z = acc_z_raw - offset  # Calibrated Z-axis
+
+        # DETECTION MODE: Check for vibration using Z-axis only
+        if not self.recording:
+            # Use absolute value of Z-axis to detect vibration in both directions
+            z_magnitude = abs(acc_z)
+
+            if z_magnitude > self.threshold:
+                # NEW: Global trigger - start ALL devices recording
+                self._trigger_detection(device_number, timestamp, z_magnitude)
+
+        # RECORDING MODE: Collect data and check stop conditions
+        else:
+            # Record data from all devices
             if device_number not in self.event_data:
                 self.event_data[device_number] = []
             self.event_data[device_number].append((timestamp, data.copy()))
-            
-            # Check if finished
+
+            # NEW: Update Z-axis stop window for this device
+            if device_number not in self.z_stop_windows:
+                self.z_stop_windows[device_number] = deque(maxlen=self.stop_window_size)
+            self.z_stop_windows[device_number].append(abs(acc_z))  # Store absolute calibrated Z
+
+            # Check stop conditions
             elapsed = timestamp - self.trigger_time
-            if elapsed >= self.post_trigger_duration:
-                # Schedule async save without blocking
+
+            # NEW: Check maximum recording duration (hard limit)
+            if elapsed >= self.max_record_seconds:
+                logger.warning(f"Maximum recording duration reached ({self.max_record_seconds}s), force stopping")
+                print(f"\n  Maximum duration reached, stopping recording...")
                 asyncio.create_task(self._end_recording())
+                return
+
+            # NEW: Check if ALL devices have Z-axis below threshold
+            if self._check_stop_condition():
+                logger.info("Stop condition met: all devices Z-axis below threshold")
+                print(f"\n  All devices stable, stopping recording...")
+                asyncio.create_task(self._end_recording())
+                return
     
+    def _check_stop_condition(self):
+        """
+        NEW: Check if recording should stop
+
+        Stop condition: ALL devices must have Z-axis values in their sliding windows
+        that are ALL below the stop threshold
+
+        Returns: True if should stop, False otherwise
+        """
+        # Need at least one device to check
+        if not self.z_stop_windows:
+            return False
+
+        # Check each connected device
+        for num, imu in self.imus.items():
+            if not imu.is_ready:
+                continue  # Skip disconnected devices
+
+            # Device must have a stop window
+            if num not in self.z_stop_windows:
+                return False  # Can't stop if we don't have data from all devices
+
+            window = self.z_stop_windows[num]
+
+            # Window must be full (or at least have some samples)
+            if len(window) == 0:
+                return False  # Can't stop without any samples
+
+            # Check if ALL values in window are below threshold
+            max_z_in_window = max(window)
+            if max_z_in_window >= self.stop_threshold_z:
+                return False  # This device still has vibration
+
+        # All devices have all values below threshold
+        return True
+
     def _trigger_detection(self, device_number, timestamp, magnitude):
-        """Trigger detection"""
+        """
+        Trigger detection
+
+        NEW: Global trigger - starts recording for ALL devices
+        """
         # Prevent triggering if already recording (avoid data overwrite)
         if self.recording:
             logger.warning(f"Skipping trigger from IMU-{device_number}: already recording")
             return
-        
+
         self.recording = True
         self.trigger_time = timestamp
         self.trigger_device = device_number
-        
+
         # Generate unique event ID with milliseconds and counter
         base_id = datetime.fromtimestamp(timestamp).strftime('%Y%m%d_%H%M%S_%f')[:19]  # Include microseconds, truncate to milliseconds
-        
+
         # Ensure uniqueness by adding counter if needed
         event_id = base_id
         counter = 1
         while (self.output_dir / f"event_{event_id}").exists():
             event_id = f"{base_id}_{counter}"
             counter += 1
-        
+
         self.event_id = event_id
         self.event_data = {}
-        
-        print(f"\nTRAIN DETECTED!")
-        print(f"   Device: {device_number}")
+
+        # NEW: Clear Z-axis stop windows for fresh start
+        for num in self.z_stop_windows.keys():
+            self.z_stop_windows[num].clear()
+
+        print(f"\nVIBRATION DETECTED! (Z-axis)")
+        print(f"   Triggered by: IMU-{device_number}")
         print(f"   Time: {datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
-        print(f"   Magnitude: {magnitude:.3f}g")
-        print(f"   Recording for {self.post_trigger_duration}s...")
-        
-        # Collect buffer data
+        print(f"   Z-axis magnitude: {magnitude:.3f}g")
+        print(f"   Recording ALL devices (max {self.max_record_seconds}s)...")
+
+        # NEW: Collect buffer data from ALL devices (global trigger)
         for num, imu in self.imus.items():
             if imu.is_ready:
                 buffer_data = imu.get_buffer_data()
@@ -1051,7 +1285,13 @@ class TrainDetector:
         if self.stats['last_event_time']:
             last = datetime.fromtimestamp(self.stats['last_event_time'])
             print(f"Last Event: {last.strftime('%Y-%m-%d %H:%M:%S')}")
-        
+
+        # NEW: Show calibration status
+        if self.last_calibration_time > 0:
+            hours_since_cal = (current_time - self.last_calibration_time) / 3600
+            print(f"Last Calibration: {hours_since_cal:.1f}h ago")
+            print(f"Z-axis Offsets: {', '.join(f'IMU-{num}:{offset:.3f}g' for num, offset in self.z_axis_offset.items())}")
+
         print(f"\nIMUs: {len(self.imus)}")
         for num in sorted(self.imus.keys()):
             imu = self.imus[num]
@@ -1098,21 +1338,32 @@ class TrainDetector:
         - Monitor device health, automatic reconnection
         - Trigger OS cleanup (extreme cases)
         - NEW: Upload health data
+        - NEW: Periodic calibration check
         - P0: Global throttling to prevent reconnection storm
         """
         logger.info("System running, press Ctrl+C to stop")
         print("Press Ctrl+C to stop\n")
-        
+
         status_interval = self.config.get('status_report_interval', 30)
         last_status = time.time()
         health_check_interval = 2  # Check every 2 seconds
         last_health_check = time.time()
-        
+
         try:
             while self.running:
                 await asyncio.sleep(1)
-                
+
                 current_time = time.time()
+
+                # NEW: Periodic calibration check (every N hours)
+                if self.last_calibration_time > 0:  # Only if initial calibration done
+                    hours_since_calibration = (current_time - self.last_calibration_time) / 3600
+                    if hours_since_calibration >= self.calibration_interval_hours:
+                        # Only calibrate when not recording
+                        if not self.recording and not self.calibrating:
+                            logger.info(f"Auto-calibration triggered ({hours_since_calibration:.1f}h since last)")
+                            print(f"\nAuto-calibration due ({hours_since_calibration:.1f}h elapsed)...")
+                            await self._perform_calibration()
                 
                 # Periodically print status
                 if current_time - last_status >= status_interval:

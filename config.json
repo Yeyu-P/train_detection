@@ -28,7 +28,16 @@
   "detection": {
     "threshold": 2.0,
     "min_duration": 1.0,
-    "post_trigger_duration": 5.0
+    "post_trigger_duration": 5.0,
+    "max_record_seconds": 60,
+    "stop_threshold_z": 0.5,
+    "stop_window_size": 50
+  },
+  "calibration": {
+    "interval_hours": 6,
+    "samples": 100,
+    "duration": 2.0,
+    "vibration_threshold": 0.3
   },
   "health_monitoring": {
     "data_timeout": 3.0,

@@ -1276,7 +1276,8 @@ class TrainDetector:
     
     def print_status(self):
         """Print status"""
-        uptime = time.time() - self.stats['uptime_start']
+        current_time = time.time()  # NEW: Define current_time for calibration status
+        uptime = current_time - self.stats['uptime_start']
         
         logger.info("=" * 60)
         logger.info("SYSTEM STATUS")

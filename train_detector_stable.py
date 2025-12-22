@@ -830,6 +830,8 @@ class TrainDetector:
                 if len(samples) < 10:
                     print(f"  IMU-{num}: Not enough samples, skipping calibration")
                     logger.warning(f"IMU-{num} calibration skipped: insufficient samples")
+                    # NEW: Set timestamp to allow retry later
+                    self.last_calibration_time = current_time - (self.calibration_interval_hours * 3600 - 300)  # Retry in 5 minutes
                     self.calibrating = False
                     return
 
@@ -841,6 +843,8 @@ class TrainDetector:
                 if std_dev > self.calibration_vibration_threshold:
                     print(f"  Vibration detected (std: {std_dev:.3f}g), postponing calibration")
                     logger.warning(f"Calibration postponed: vibration detected (std: {std_dev:.3f}g)")
+                    # NEW: Set timestamp even if skipped, to allow retry later
+                    self.last_calibration_time = current_time - (self.calibration_interval_hours * 3600 - 300)  # Retry in 5 minutes
                     self.calibrating = False
                     return
 
@@ -1005,6 +1009,9 @@ class TrainDetector:
         if not self.z_stop_windows:
             return False
 
+        # NEW: Track if we checked at least one device
+        checked_devices = 0
+
         # Check each connected device
         for num, imu in self.imus.items():
             if not imu.is_ready:
@@ -1020,10 +1027,17 @@ class TrainDetector:
             if len(window) == 0:
                 return False  # Can't stop without any samples
 
+            # NEW: Count this device as checked
+            checked_devices += 1
+
             # Check if ALL values in window are below threshold
             max_z_in_window = max(window)
             if max_z_in_window >= self.stop_threshold_z:
                 return False  # This device still has vibration
+
+        # NEW: If all devices disconnected during recording, can't stop safely
+        if checked_devices == 0:
+            return False
 
         # All devices have all values below threshold
         return True

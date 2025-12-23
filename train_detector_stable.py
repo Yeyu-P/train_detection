@@ -1323,14 +1323,38 @@ class TrainDetector:
             self.stats['total_events'] += 1
             self.stats['last_event_time'] = trigger_time
 
-            # NEW: Calculate max acceleration for upload (before metadata is created in sync function)
+            # NEW: Calculate max acceleration and prepare summary data for upload
             max_acc = 0.0
+            summary_devices = []
+
             for dev_num, data_list in event_data_copy.items():
+                if not data_list:
+                    continue
+
+                # Calculate max acceleration for event_end
                 for ts, data in data_list:
                     acc = (data.get('AccX', 0)**2 +
                           data.get('AccY', 0)**2 +
                           data.get('AccZ', 0)**2)**0.5
                     max_acc = max(max_acc, acc)
+
+                # Calculate Z-axis statistics for summary
+                z_values = []
+                for ts, data in data_list:
+                    acc_z_raw = data.get('AccZ', 0)
+                    offset = self.z_axis_offset.get(dev_num, 0.0)
+                    z_values.append(abs(acc_z_raw - offset))
+
+                max_z = max(z_values) if z_values else 0.0
+                avg_z = sum(z_values) / len(z_values) if z_values else 0.0
+
+                summary_devices.append({
+                    'device_number': dev_num,
+                    'sample_count': len(data_list),
+                    'max_z_acceleration': round(max_z, 3),
+                    'avg_z_acceleration': round(avg_z, 3),
+                    'calibration_offset': round(self.z_axis_offset.get(dev_num, 0.0), 3)
+                })
 
             # NEW: Upload event end (non-blocking, fire-and-forget)
             asyncio.create_task(
@@ -1339,6 +1363,14 @@ class TrainDetector:
                     datetime.fromtimestamp(trigger_time + duration).isoformat(),
                     duration,
                     round(max_acc, 3)
+                )
+            )
+
+            # NEW: Upload event summary (non-blocking, fire-and-forget)
+            asyncio.create_task(
+                self.event_uploader.upload_event_summary(
+                    event_id,
+                    summary_devices
                 )
             )
     

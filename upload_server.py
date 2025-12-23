@@ -34,7 +34,7 @@ class HealthDataStore:
         """Initialize database schema"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         # System status table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS system_status (
@@ -48,7 +48,7 @@ class HealthDataStore:
                 upload_failures INTEGER
             )
         ''')
-        
+
         # IMU status table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS imu_status (
@@ -76,7 +76,7 @@ class HealthDataStore:
                 FOREIGN KEY (system_id) REFERENCES system_status(id)
             )
         ''')
-        
+
         # Alerts table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS alerts (
@@ -90,7 +90,50 @@ class HealthDataStore:
                 resolved BOOLEAN DEFAULT 0
             )
         ''')
-        
+
+        # NEW: Train events table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS train_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT UNIQUE,
+                event_type TEXT,
+                trigger_time TEXT,
+                end_time TEXT,
+                duration REAL,
+                trigger_device INTEGER,
+                z_magnitude REAL,
+                max_acceleration REAL,
+                created_at TEXT
+            )
+        ''')
+
+        # NEW: Event summary table (per-device statistics)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS event_summary (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT,
+                device_number INTEGER,
+                sample_count INTEGER,
+                max_z_acceleration REAL,
+                avg_z_acceleration REAL,
+                calibration_offset REAL,
+                FOREIGN KEY (event_id) REFERENCES train_events(event_id)
+            )
+        ''')
+
+        # NEW: Warnings table (separate from alerts for system warnings)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                warning_type TEXT,
+                device_number INTEGER,
+                device_name TEXT,
+                message TEXT,
+                severity TEXT
+            )
+        ''')
+
         conn.commit()
         conn.close()
         logger.info(f"Database initialized: {self.db_path}")
@@ -362,10 +405,19 @@ class HealthMonitoringServer:
     
     def _setup_routes(self):
         """Setup HTTP routes"""
+        # Health monitoring
         self.app.router.add_post('/api/imu/status', self.handle_status)
         self.app.router.add_get('/api/system/recent', self.handle_get_recent)
         self.app.router.add_get('/api/alerts/active', self.handle_get_alerts)
         self.app.router.add_get('/api/stats', self.handle_get_stats)
+
+        # NEW: Train event endpoints
+        self.app.router.add_post('/api/events/start', self.handle_event_start)
+        self.app.router.add_post('/api/events/end', self.handle_event_end)
+        self.app.router.add_post('/api/events/summary', self.handle_event_summary)
+        self.app.router.add_post('/api/warnings', self.handle_warning)
+
+        # Web interface
         self.app.router.add_get('/', self.handle_index)
     
     async def handle_status(self, request):
@@ -456,29 +508,390 @@ class HealthMonitoringServer:
             'error_rate': self.total_errors / max(self.total_requests, 1),
             'last_update': self.last_update_time.isoformat() if self.last_update_time else None
         })
+
+    async def handle_event_start(self, request):
+        """Handle train detection start event"""
+        self.total_requests += 1
+
+        try:
+            data = await request.json()
+
+            event_id = data.get('event_id')
+            logger.info(f"Train detected: {event_id}")
+            print(f"\n🚂 TRAIN DETECTED: {event_id}")
+            print(f"   Trigger device: IMU-{data.get('trigger_device')}")
+            print(f"   Z-magnitude: {data.get('z_magnitude')}g")
+            print(f"   Time: {data.get('trigger_time')}\n")
+
+            # Store to database
+            conn = sqlite3.connect(self.data_store.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                INSERT OR IGNORE INTO train_events
+                (event_id, event_type, trigger_time, trigger_device, z_magnitude, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                event_id,
+                data.get('event_type', 'train_detected'),
+                data.get('trigger_time'),
+                data.get('trigger_device'),
+                data.get('z_magnitude'),
+                datetime.now().isoformat()
+            ))
+
+            conn.commit()
+            conn.close()
+
+            return web.json_response({'status': 'ok'})
+
+        except Exception as e:
+            self.total_errors += 1
+            logger.error(f"Event start error: {e}")
+            return web.Response(status=500, text=str(e))
+
+    async def handle_event_end(self, request):
+        """Handle train passed (end) event"""
+        self.total_requests += 1
+
+        try:
+            data = await request.json()
+
+            event_id = data.get('event_id')
+            logger.info(f"Train passed: {event_id}")
+            print(f"\n✅ TRAIN PASSED: {event_id}")
+            print(f"   Duration: {data.get('duration')}s")
+            print(f"   Max acceleration: {data.get('max_acceleration')}g")
+            print(f"   End time: {data.get('end_time')}\n")
+
+            # Update database
+            conn = sqlite3.connect(self.data_store.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                UPDATE train_events
+                SET end_time = ?, duration = ?, max_acceleration = ?
+                WHERE event_id = ?
+            ''', (
+                data.get('end_time'),
+                data.get('duration'),
+                data.get('max_acceleration'),
+                event_id
+            ))
+
+            conn.commit()
+            conn.close()
+
+            return web.json_response({'status': 'ok'})
+
+        except Exception as e:
+            self.total_errors += 1
+            logger.error(f"Event end error: {e}")
+            return web.Response(status=500, text=str(e))
+
+    async def handle_event_summary(self, request):
+        """Handle event summary with per-device statistics"""
+        self.total_requests += 1
+
+        try:
+            data = await request.json()
+
+            event_id = data.get('event_id')
+            devices = data.get('devices', [])
+
+            logger.info(f"Event summary: {event_id} ({len(devices)} devices)")
+            print(f"\n📊 EVENT SUMMARY: {event_id}")
+            for dev in devices:
+                print(f"   IMU-{dev.get('device_number')}: {dev.get('sample_count')} samples, "
+                      f"max_z={dev.get('max_z_acceleration')}g")
+
+            # Store to database
+            conn = sqlite3.connect(self.data_store.db_path)
+            cursor = conn.cursor()
+
+            for dev in devices:
+                cursor.execute('''
+                    INSERT INTO event_summary
+                    (event_id, device_number, sample_count, max_z_acceleration,
+                     avg_z_acceleration, calibration_offset)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (
+                    event_id,
+                    dev.get('device_number'),
+                    dev.get('sample_count'),
+                    dev.get('max_z_acceleration'),
+                    dev.get('avg_z_acceleration'),
+                    dev.get('calibration_offset')
+                ))
+
+            conn.commit()
+            conn.close()
+
+            return web.json_response({'status': 'ok'})
+
+        except Exception as e:
+            self.total_errors += 1
+            logger.error(f"Event summary error: {e}")
+            return web.Response(status=500, text=str(e))
+
+    async def handle_warning(self, request):
+        """Handle system warnings"""
+        self.total_requests += 1
+
+        try:
+            data = await request.json()
+
+            warning_type = data.get('warning_type')
+            severity = data.get('severity', 'medium')
+
+            severity_icon = '⚠️' if severity == 'medium' else '🔴'
+            logger.warning(f"{severity_icon} {data.get('message')}")
+            print(f"\n{severity_icon} WARNING: {warning_type}")
+            print(f"   Device: IMU-{data.get('device_number')} ({data.get('device_name')})")
+            print(f"   Message: {data.get('message')}\n")
+
+            # Store to database
+            conn = sqlite3.connect(self.data_store.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                INSERT INTO warnings
+                (timestamp, warning_type, device_number, device_name, message, severity)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                data.get('timestamp'),
+                warning_type,
+                data.get('device_number'),
+                data.get('device_name'),
+                data.get('message'),
+                severity
+            ))
+
+            conn.commit()
+            conn.close()
+
+            return web.json_response({'status': 'ok'})
+
+        except Exception as e:
+            self.total_errors += 1
+            logger.error(f"Warning error: {e}")
+            return web.Response(status=500, text=str(e))
     
     async def handle_index(self, request):
-        """Simple status page"""
-        html = f"""
-        <html>
-        <head><title>IMU Health Monitor</title></head>
-        <body>
-            <h1>IMU Health Monitoring Server</h1>
-            <p>Status: Running</p>
-            <p>Total Requests: {self.total_requests}</p>
-            <p>Total Errors: {self.total_errors}</p>
-            <p>Last Update: {self.last_update_time or 'Never'}</p>
-            <h2>API Endpoints</h2>
-            <ul>
-                <li>POST /api/imu/status - Receive IMU health data</li>
-                <li>GET /api/system/recent?limit=10 - Recent system status</li>
-                <li>GET /api/alerts/active - Active alerts</li>
-                <li>GET /api/stats - Server statistics</li>
-            </ul>
-        </body>
-        </html>
-        """
-        return web.Response(text=html, content_type='text/html')
+        """Comprehensive status page with train events"""
+        try:
+            # Get recent train events
+            conn = sqlite3.connect(self.data_store.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                SELECT event_id, trigger_time, end_time, duration, trigger_device,
+                       z_magnitude, max_acceleration
+                FROM train_events
+                ORDER BY id DESC
+                LIMIT 10
+            ''')
+            train_events = cursor.fetchall()
+
+            # Get recent warnings
+            cursor.execute('''
+                SELECT timestamp, warning_type, device_number, device_name, message, severity
+                FROM warnings
+                ORDER BY id DESC
+                LIMIT 10
+            ''')
+            warnings = cursor.fetchall()
+
+            conn.close()
+
+            # Build train events HTML
+            train_events_html = ""
+            for event in train_events:
+                event_id, trigger_time, end_time, duration, trigger_dev, z_mag, max_acc = event
+                status = "✅ Completed" if end_time else "🚂 In Progress"
+                duration_str = f"{duration:.1f}s" if duration else "N/A"
+                max_acc_str = f"{max_acc:.2f}g" if max_acc else "N/A"
+
+                train_events_html += f"""
+                <tr>
+                    <td>{status}</td>
+                    <td>{event_id}</td>
+                    <td>IMU-{trigger_dev}</td>
+                    <td>{z_mag:.2f}g</td>
+                    <td>{duration_str}</td>
+                    <td>{max_acc_str}</td>
+                    <td>{trigger_time[:19] if trigger_time else 'N/A'}</td>
+                </tr>
+                """
+
+            # Build warnings HTML
+            warnings_html = ""
+            for warn in warnings:
+                timestamp, warn_type, dev_num, dev_name, message, severity = warn
+                severity_icon = "🔴" if severity == "high" else "⚠️"
+                warnings_html += f"""
+                <tr>
+                    <td>{severity_icon} {severity.upper()}</td>
+                    <td>{warn_type}</td>
+                    <td>IMU-{dev_num}</td>
+                    <td>{message}</td>
+                    <td>{timestamp[:19] if timestamp else 'N/A'}</td>
+                </tr>
+                """
+
+            html = f"""
+            <html>
+            <head>
+                <title>Train Detection System - Monitoring Dashboard</title>
+                <meta http-equiv="refresh" content="30">
+                <style>
+                    body {{
+                        font-family: Arial, sans-serif;
+                        margin: 20px;
+                        background-color: #f5f5f5;
+                    }}
+                    h1 {{
+                        color: #333;
+                        border-bottom: 3px solid #4CAF50;
+                        padding-bottom: 10px;
+                    }}
+                    h2 {{
+                        color: #555;
+                        margin-top: 30px;
+                        border-bottom: 2px solid #2196F3;
+                        padding-bottom: 5px;
+                    }}
+                    .status-box {{
+                        background-color: white;
+                        padding: 15px;
+                        border-radius: 5px;
+                        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                        margin-bottom: 20px;
+                    }}
+                    table {{
+                        width: 100%;
+                        border-collapse: collapse;
+                        background-color: white;
+                        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    }}
+                    th {{
+                        background-color: #4CAF50;
+                        color: white;
+                        padding: 12px;
+                        text-align: left;
+                    }}
+                    td {{
+                        padding: 10px;
+                        border-bottom: 1px solid #ddd;
+                    }}
+                    tr:hover {{
+                        background-color: #f5f5f5;
+                    }}
+                    .warning-table th {{
+                        background-color: #ff9800;
+                    }}
+                    .stats {{
+                        display: flex;
+                        gap: 20px;
+                        margin-bottom: 20px;
+                    }}
+                    .stat-card {{
+                        flex: 1;
+                        background-color: white;
+                        padding: 15px;
+                        border-radius: 5px;
+                        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    }}
+                    .stat-value {{
+                        font-size: 24px;
+                        font-weight: bold;
+                        color: #4CAF50;
+                    }}
+                    .stat-label {{
+                        color: #777;
+                        font-size: 14px;
+                    }}
+                </style>
+            </head>
+            <body>
+                <h1>🚂 Train Detection System - Monitoring Dashboard</h1>
+
+                <div class="status-box">
+                    <p><strong>Server Status:</strong> 🟢 Running</p>
+                    <p><strong>Last Update:</strong> {self.last_update_time or 'Never'}</p>
+                    <p><strong>Auto-refresh:</strong> Every 30 seconds</p>
+                </div>
+
+                <div class="stats">
+                    <div class="stat-card">
+                        <div class="stat-value">{len(train_events)}</div>
+                        <div class="stat-label">Recent Train Events</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">{self.total_requests}</div>
+                        <div class="stat-label">Total Requests</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">{self.total_errors}</div>
+                        <div class="stat-label">Total Errors</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">{len(warnings)}</div>
+                        <div class="stat-label">Recent Warnings</div>
+                    </div>
+                </div>
+
+                <h2>🚂 Recent Train Events</h2>
+                <table>
+                    <tr>
+                        <th>Status</th>
+                        <th>Event ID</th>
+                        <th>Trigger Device</th>
+                        <th>Z-Magnitude</th>
+                        <th>Duration</th>
+                        <th>Max Acceleration</th>
+                        <th>Time</th>
+                    </tr>
+                    {train_events_html if train_events_html else '<tr><td colspan="7">No train events yet</td></tr>'}
+                </table>
+
+                <h2>⚠️ Recent Warnings</h2>
+                <table class="warning-table">
+                    <tr>
+                        <th>Severity</th>
+                        <th>Type</th>
+                        <th>Device</th>
+                        <th>Message</th>
+                        <th>Time</th>
+                    </tr>
+                    {warnings_html if warnings_html else '<tr><td colspan="5">No warnings</td></tr>'}
+                </table>
+
+                <h2>API Endpoints</h2>
+                <div class="status-box">
+                    <h3>Health Monitoring</h3>
+                    <ul>
+                        <li>POST /api/imu/status - Receive IMU health data</li>
+                        <li>GET /api/system/recent?limit=10 - Recent system status</li>
+                        <li>GET /api/alerts/active - Active alerts</li>
+                        <li>GET /api/stats - Server statistics</li>
+                    </ul>
+                    <h3>Train Events</h3>
+                    <ul>
+                        <li>POST /api/events/start - Train detection start</li>
+                        <li>POST /api/events/end - Train passed (end)</li>
+                        <li>POST /api/events/summary - Event summary data</li>
+                        <li>POST /api/warnings - System warnings</li>
+                    </ul>
+                </div>
+            </body>
+            </html>
+            """
+            return web.Response(text=html, content_type='text/html')
+
+        except Exception as e:
+            logger.error(f"Index page error: {e}")
+            return web.Response(text=f"Error: {e}", status=500)
     
     def _print_status_summary(self, data, alerts):
         """Print status summary to console"""

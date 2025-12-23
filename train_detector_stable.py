@@ -326,6 +326,180 @@ class IMUManager:
         return status
 
 
+class EventUploader:
+    """
+    HTTP event uploader for train detection events
+    All uploads are asynchronous and non-blocking
+    Network failures are isolated and only logged
+    Can be completely disabled via config
+    """
+
+    def __init__(self, config):
+        upload_config = config.get('event_upload', {})
+
+        self.enabled = upload_config.get('enabled', False)
+        self.base_url = upload_config.get('base_url', 'http://127.0.0.1:8000')
+
+        endpoints = upload_config.get('endpoints', {})
+        self.endpoint_event_start = endpoints.get('event_start', '/api/events/start')
+        self.endpoint_event_end = endpoints.get('event_end', '/api/events/end')
+        self.endpoint_summary = endpoints.get('summary', '/api/events/summary')
+        self.endpoint_warning = endpoints.get('warning', '/api/warnings')
+
+        self.timeout = upload_config.get('timeout_sec', 2.0)
+
+        # Statistics
+        self.upload_count = 0
+        self.upload_failures = 0
+
+        if self.enabled:
+            logger.info(f"Event uploader enabled: {self.base_url}")
+            print(f"Event uploader enabled: {self.base_url}")
+
+    async def upload_event_start(self, event_id, trigger_time, trigger_device, z_magnitude):
+        """Upload train detection start event (non-blocking, fire-and-forget)"""
+        if not self.enabled:
+            return
+
+        try:
+            data = {
+                'event_type': 'train_detected',
+                'event_id': event_id,
+                'trigger_time': trigger_time,
+                'trigger_device': trigger_device,
+                'z_magnitude': z_magnitude
+            }
+
+            url = f"{self.base_url}{self.endpoint_event_start}"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=data,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout)
+                ) as response:
+                    if response.status == 200:
+                        self.upload_count += 1
+                        logger.debug(f"Event start uploaded: {event_id}")
+                    else:
+                        self.upload_failures += 1
+                        logger.warning(f"Event start upload failed: HTTP {response.status}")
+
+        except asyncio.TimeoutError:
+            self.upload_failures += 1
+            logger.debug(f"Event start upload timeout: {event_id}")
+        except Exception as e:
+            self.upload_failures += 1
+            logger.debug(f"Event start upload error: {e}")
+
+    async def upload_event_end(self, event_id, end_time, duration, max_acceleration):
+        """Upload train detection end event (non-blocking, fire-and-forget)"""
+        if not self.enabled:
+            return
+
+        try:
+            data = {
+                'event_type': 'train_passed',
+                'event_id': event_id,
+                'end_time': end_time,
+                'duration': duration,
+                'max_acceleration': max_acceleration
+            }
+
+            url = f"{self.base_url}{self.endpoint_event_end}"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=data,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout)
+                ) as response:
+                    if response.status == 200:
+                        self.upload_count += 1
+                        logger.debug(f"Event end uploaded: {event_id}")
+                    else:
+                        self.upload_failures += 1
+                        logger.warning(f"Event end upload failed: HTTP {response.status}")
+
+        except asyncio.TimeoutError:
+            self.upload_failures += 1
+            logger.debug(f"Event end upload timeout: {event_id}")
+        except Exception as e:
+            self.upload_failures += 1
+            logger.debug(f"Event end upload error: {e}")
+
+    async def upload_event_summary(self, event_id, summary_data):
+        """Upload event summary with per-device statistics (non-blocking, fire-and-forget)"""
+        if not self.enabled:
+            return
+
+        try:
+            data = {
+                'event_type': 'event_summary',
+                'event_id': event_id,
+                'devices': summary_data
+            }
+
+            url = f"{self.base_url}{self.endpoint_summary}"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=data,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout)
+                ) as response:
+                    if response.status == 200:
+                        self.upload_count += 1
+                        logger.debug(f"Event summary uploaded: {event_id}")
+                    else:
+                        self.upload_failures += 1
+                        logger.warning(f"Event summary upload failed: HTTP {response.status}")
+
+        except asyncio.TimeoutError:
+            self.upload_failures += 1
+            logger.debug(f"Event summary upload timeout: {event_id}")
+        except Exception as e:
+            self.upload_failures += 1
+            logger.debug(f"Event summary upload error: {e}")
+
+    async def upload_warning(self, warning_type, device_number, device_name, message, severity='medium'):
+        """Upload system warning/alert (non-blocking, fire-and-forget)"""
+        if not self.enabled:
+            return
+
+        try:
+            data = {
+                'warning_type': warning_type,
+                'timestamp': datetime.now().isoformat(),
+                'device_number': device_number,
+                'device_name': device_name,
+                'message': message,
+                'severity': severity
+            }
+
+            url = f"{self.base_url}{self.endpoint_warning}"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=data,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout)
+                ) as response:
+                    if response.status == 200:
+                        self.upload_count += 1
+                        logger.debug(f"Warning uploaded: {warning_type}")
+                    else:
+                        self.upload_failures += 1
+                        logger.warning(f"Warning upload failed: HTTP {response.status}")
+
+        except asyncio.TimeoutError:
+            self.upload_failures += 1
+            logger.debug(f"Warning upload timeout: {warning_type}")
+        except Exception as e:
+            self.upload_failures += 1
+            logger.debug(f"Warning upload error: {e}")
+
+
 class HealthUploader:
     """
     NEW: Non-blocking health data uploader
@@ -501,7 +675,10 @@ class TrainDetector:
         
         # NEW: Health uploader
         self.health_uploader = HealthUploader(self.config)
-        
+
+        # NEW: Event uploader (can be disabled via config)
+        self.event_uploader = EventUploader(self.config)
+
         # NEW: Save operation lock (prevent race conditions)
         self._save_lock = asyncio.Lock()
         
@@ -1080,6 +1257,16 @@ class TrainDetector:
         print(f"   Z-axis magnitude: {magnitude:.3f}g")
         print(f"   Recording ALL devices (max {self.max_record_seconds}s)...")
 
+        # NEW: Upload event start (non-blocking, fire-and-forget)
+        asyncio.create_task(
+            self.event_uploader.upload_event_start(
+                event_id,
+                datetime.fromtimestamp(timestamp).isoformat(),
+                device_number,
+                magnitude
+            )
+        )
+
         # NEW: Collect buffer data from ALL devices (global trigger)
         for num, imu in self.imus.items():
             if imu.is_ready:
@@ -1135,6 +1322,47 @@ class TrainDetector:
             # Update statistics
             self.stats['total_events'] += 1
             self.stats['last_event_time'] = trigger_time
+
+            # NEW: Upload event end and summary (non-blocking, fire-and-forget)
+            asyncio.create_task(
+                self.event_uploader.upload_event_end(
+                    event_id,
+                    datetime.fromtimestamp(trigger_time + duration).isoformat(),
+                    duration,
+                    metadata.get('max_acceleration', 0.0)
+                )
+            )
+
+            # NEW: Prepare and upload event summary
+            summary_devices = []
+            for dev_num, data_list in event_data_copy.items():
+                if not data_list:
+                    continue
+
+                # Calculate statistics for this device
+                z_values = []
+                for ts, data in data_list:
+                    acc_z_raw = data.get('AccZ', 0)
+                    offset = self.z_axis_offset.get(dev_num, 0.0)
+                    z_values.append(abs(acc_z_raw - offset))
+
+                max_z = max(z_values) if z_values else 0.0
+                avg_z = sum(z_values) / len(z_values) if z_values else 0.0
+
+                summary_devices.append({
+                    'device_number': dev_num,
+                    'sample_count': len(data_list),
+                    'max_z_acceleration': round(max_z, 3),
+                    'avg_z_acceleration': round(avg_z, 3),
+                    'calibration_offset': round(self.z_axis_offset.get(dev_num, 0.0), 3)
+                })
+
+            asyncio.create_task(
+                self.event_uploader.upload_event_summary(
+                    event_id,
+                    summary_devices
+                )
+            )
     
     def _save_event_data_sync(self, event_id, trigger_device, trigger_time, duration, event_data_copy):
         """
@@ -1294,8 +1522,12 @@ class TrainDetector:
         print(f"OS Cleanups: {self.stats['total_os_cleanups']}")
         
         if self.health_uploader.enabled:
-            print(f"Upload Count: {self.health_uploader.upload_count}")
-            print(f"Upload Failures: {self.health_uploader.upload_failures}")
+            print(f"Health Upload Count: {self.health_uploader.upload_count}")
+            print(f"Health Upload Failures: {self.health_uploader.upload_failures}")
+
+        if self.event_uploader.enabled:
+            print(f"Event Upload Count: {self.event_uploader.upload_count}")
+            print(f"Event Upload Failures: {self.event_uploader.upload_failures}")
         
         if self.stats['last_event_time']:
             last = datetime.fromtimestamp(self.stats['last_event_time'])
@@ -1427,6 +1659,17 @@ class TrainDetector:
                             logger.info(
                                 f"Total reconnects: {self.stats['total_reconnects']}"
                             )
+
+                            # NEW: Upload reconnection warning (non-blocking)
+                            asyncio.create_task(
+                                self.event_uploader.upload_warning(
+                                    'device_reconnected',
+                                    num,
+                                    imu.name,
+                                    f"Device {imu.name} reconnected after health check failure",
+                                    'medium'
+                                )
+                            )
                         
                         # Check if OS cleanup is needed
                         if imu.should_trigger_os_cleanup():
@@ -1446,10 +1689,21 @@ class TrainDetector:
                             
                             # Execute OS cleanup (automatically pauses all BLE operations)
                             cleanup_success = await self._os_level_ble_cleanup(imu.mac)
-                            
+
+                            # NEW: Upload OS cleanup warning (non-blocking)
+                            asyncio.create_task(
+                                self.event_uploader.upload_warning(
+                                    'os_cleanup_triggered',
+                                    num,
+                                    imu.name,
+                                    f"OS-level BLE cleanup triggered for {imu.name} due to consecutive failures",
+                                    'high'
+                                )
+                            )
+
                             # P0: Update global OS cleanup time
                             self.last_os_cleanup_global = current_time
-                            
+
                             if cleanup_success:
                                 # Reset device failure count
                                 if imu.device:

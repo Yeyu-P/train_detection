@@ -66,6 +66,17 @@
     "timeout": 5.0,
     "retry_on_failure": false
   },
+  "event_upload": {
+    "enabled": false,
+    "base_url": "http://127.0.0.1:8000",
+    "endpoints": {
+      "event_start": "/api/events/start",
+      "event_end": "/api/events/end",
+      "summary": "/api/events/summary",
+      "warning": "/api/warnings"
+    },
+    "timeout_sec": 2.0
+  },
   "output": {
     "directory": "train_events",
     "db_name": "events.db",

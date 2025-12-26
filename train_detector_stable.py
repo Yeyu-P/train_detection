@@ -515,6 +515,7 @@ class GoogleDriveUploader:
         self.credentials_file = gdrive_config.get('credentials_file', 'service_account.json')
         self.folder_id = gdrive_config.get('folder_id', '')
         self.upload_delay = gdrive_config.get('upload_delay_seconds', 5)
+        self.owner_email = gdrive_config.get('owner_email', '')  # NEW: User's email for ownership transfer
 
         self.upload_count = 0
         self.upload_failures = 0
@@ -584,6 +585,27 @@ class GoogleDriveUploader:
             drive_folder_id = folder.get('id')
 
             logger.info(f"Created Google Drive folder: {event_dir.name}")
+
+            # Transfer ownership to user to avoid service account storage quota issue
+            if self.owner_email:
+                try:
+                    permission = {
+                        'type': 'user',
+                        'role': 'owner',
+                        'emailAddress': self.owner_email
+                    }
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.service.permissions().create(
+                            fileId=drive_folder_id,
+                            body=permission,
+                            transferOwnership=True
+                        ).execute()
+                    )
+                    logger.info(f"Transferred folder ownership to {self.owner_email}")
+                except Exception as e:
+                    logger.warning(f"Failed to transfer ownership: {e}")
+                    # Continue anyway - folder is still accessible
 
             # Upload all files in the event directory
             uploaded_files = 0

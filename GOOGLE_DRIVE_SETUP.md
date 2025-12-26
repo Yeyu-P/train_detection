@@ -195,6 +195,7 @@ python3 -c "from googleapiclient.discovery import build; print('Google API libra
   "enabled": true,
   "credentials_file": "service_account.json",
   "folder_id": "1a2B3c4D5e6F7g8H9i0J1k2L3m4N5o6P",
+  "owner_email": "your-email@gmail.com",
   "upload_delay_seconds": 5
 }
 ```
@@ -203,6 +204,7 @@ python3 -c "from googleapiclient.discovery import build; print('Google API libra
 - `enabled`: 设置为 `true` 启用 Google Drive 上传
 - `credentials_file`: 凭证文件路径（相对于项目根目录）
 - `folder_id`: 前面获取的 Google Drive 文件夹 ID
+- `owner_email`: **重要！** 你的 Google 账号邮箱（用于自动转移文件夹所有权，避免服务账户存储配额限制）
 - `upload_delay_seconds`: 事件结束后延迟多少秒再上传（默认 5 秒，确保文件已完全写入）
 
 ---
@@ -281,7 +283,42 @@ ls -l /home/user/train_detection/service_account.json
 
 ---
 
-### 问题 3: 上传时报错 "403 Forbidden" 或 "Insufficient Permission"
+### 问题 3: 上传时报错 "Service Accounts do not have storage quota" 或 "storageQuotaExceeded"
+
+**原因**：服务账户自己没有存储空间，但系统试图把文件上传到服务账户自己的 Drive
+
+**最常见原因**：
+1. `owner_email` 配置为空或未设置
+2. 文件夹所有权未正确转移
+
+**解决方法**：
+
+1. **确认 `owner_email` 已配置**：
+   ```json
+   "google_drive": {
+     "enabled": true,
+     "owner_email": "your-email@gmail.com"  // 必须填写你的 Gmail 地址
+   }
+   ```
+
+2. **邮箱地址必须是登录 Google Drive 的那个账号**
+
+3. **重启系统**让配置生效
+
+4. **验证配置**：
+   ```bash
+   grep owner_email config.json
+   ```
+   应该显示你的邮箱地址，不能是空字符串
+
+**工作原理**：
+- 服务账户创建文件夹后，立即把所有权转移给你
+- 文件上传到你拥有的文件夹，使用你的存储空间
+- 这样就不会触发服务账户的存储配额限制
+
+---
+
+### 问题 4: 上传时报错 "403 Forbidden" 或 "Insufficient Permission"
 
 **原因**：服务账户没有文件夹访问权限
 
@@ -296,7 +333,7 @@ ls -l /home/user/train_detection/service_account.json
 
 ---
 
-### 问题 4: 上传时报错 "404 Not Found" 或 "File not found"
+### 问题 5: 上传时报错 "404 Not Found" 或 "File not found"
 
 **原因**：文件夹 ID 不正确
 
@@ -328,7 +365,7 @@ ls -l /home/user/train_detection/service_account.json
 
 ---
 
-### 问题 5: 上传成功但 Google Drive 中看不到文件
+### 问题 6: 上传成功但 Google Drive 中看不到文件
 
 **原因**：可能上传到了服务账户的 Drive，而不是你的个人 Drive
 
@@ -340,7 +377,7 @@ ls -l /home/user/train_detection/service_account.json
 
 ---
 
-### 问题 6: 上传速度很慢
+### 问题 7: 上传速度很慢
 
 **原因**：网络带宽限制或文件较大
 
@@ -353,7 +390,7 @@ ls -l /home/user/train_detection/service_account.json
 
 ---
 
-### 问题 7: 想要临时禁用上传
+### 问题 8: 想要临时禁用上传
 
 **解决方法**：
 编辑 `config.json`，将 `enabled` 设置为 `false`：
@@ -369,7 +406,7 @@ ls -l /home/user/train_detection/service_account.json
 
 ---
 
-### 问题 8: 想要查看详细的上传日志
+### 问题 9: 想要查看详细的上传日志
 
 **解决方法**：
 查看系统日志文件：
@@ -380,7 +417,7 @@ tail -f /home/user/train_detection/train_detector.log | grep -i "drive"
 
 ---
 
-### 问题 9: 服务账户凭证泄露了怎么办
+### 问题 10: 服务账户凭证泄露了怎么办
 
 **解决方法**：
 1. **立即禁用旧密钥**：

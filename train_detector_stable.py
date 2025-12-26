@@ -555,12 +555,13 @@ class GoogleDriveUploader:
             self.enabled = False
 
     async def upload_event_folder(self, event_dir_path):
-        """Upload event files directly to Google Drive (non-blocking)"""
+        """Compress event folder to ZIP and upload to Google Drive (non-blocking)"""
         if not self.enabled or not self.service:
             return
 
         try:
             from googleapiclient.http import MediaFileUpload
+            import zipfile
 
             event_dir = Path(event_dir_path)
             if not event_dir.exists():
@@ -570,39 +571,51 @@ class GoogleDriveUploader:
             # Wait a bit to ensure all files are written
             await asyncio.sleep(self.upload_delay)
 
-            # Get event name prefix (e.g., "event_20251226_230829")
-            event_prefix = event_dir.name
+            # Get event name (e.g., "event_20251226_230829")
+            event_name = event_dir.name
 
-            # Upload all files directly to the shared folder with event prefix
-            uploaded_files = 0
-            for file_path in event_dir.iterdir():
-                if file_path.is_file():
-                    # Add event prefix to filename: event_20251226_230829_metadata.json
-                    prefixed_name = f"{event_prefix}_{file_path.name}"
+            # Create ZIP file path in the same parent directory
+            zip_path = event_dir.parent / f"{event_name}.zip"
 
-                    file_metadata = {
-                        'name': prefixed_name,
-                        'parents': [self.folder_id] if self.folder_id else []
-                    }
+            # Create ZIP file with all event files
+            def create_zip():
+                with zipfile.ZipFile(str(zip_path), 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    file_count = 0
+                    for file_path in event_dir.iterdir():
+                        if file_path.is_file():
+                            # Add file to zip with relative path (inside event folder)
+                            arcname = f"{event_name}/{file_path.name}"
+                            zipf.write(str(file_path), arcname)
+                            file_count += 1
+                    return file_count
 
-                    media = MediaFileUpload(str(file_path), resumable=True)
+            # Create ZIP in executor to avoid blocking
+            file_count = await asyncio.get_event_loop().run_in_executor(None, create_zip)
+            logger.info(f"Created ZIP archive: {zip_path.name} ({file_count} files)")
 
-                    # Use a wrapper function to capture the current media object
-                    def upload_file(metadata=file_metadata, media_obj=media):
-                        return self.service.files().create(
-                            body=metadata,
-                            media_body=media_obj,
-                            fields='id'
-                        ).execute()
+            # Upload ZIP file to Google Drive
+            file_metadata = {
+                'name': f"{event_name}.zip",
+                'parents': [self.folder_id] if self.folder_id else []
+            }
 
-                    await asyncio.get_event_loop().run_in_executor(None, upload_file)
+            media = MediaFileUpload(str(zip_path), resumable=True)
 
-                    uploaded_files += 1
-                    logger.debug(f"Uploaded to Google Drive: {prefixed_name}")
+            def upload_zip():
+                return self.service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields='id'
+                ).execute()
+
+            await asyncio.get_event_loop().run_in_executor(None, upload_zip)
+
+            # Clean up ZIP file after successful upload (optional - keep for local backup)
+            # zip_path.unlink()  # Uncomment to delete ZIP after upload
 
             self.upload_count += 1
-            logger.info(f"Google Drive upload complete: {event_prefix} ({uploaded_files} files)")
-            print(f"   Uploaded to Google Drive: {event_prefix} ({uploaded_files} files)")
+            logger.info(f"Google Drive upload complete: {event_name}.zip")
+            print(f"   Uploaded to Google Drive: {event_name}.zip ({file_count} files compressed)")
 
         except Exception as e:
             self.upload_failures += 1

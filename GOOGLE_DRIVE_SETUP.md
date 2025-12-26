@@ -206,9 +206,14 @@ python3 -c "from googleapiclient.discovery import build; print('Google API libra
 - `upload_delay_seconds`: 事件结束后延迟多少秒再上传（默认 5 秒，确保文件已完全写入）
 
 **文件组织方式**：
-- 所有事件文件直接上传到你指定的文件夹，不创建子文件夹
-- 文件名格式：`event_20251226_230829_metadata.json`、`event_20251226_230829_device_1.csv` 等
-- 使用事件 ID 前缀区分不同事件的文件
+- 每个事件自动压缩成 ZIP 文件后上传
+- 文件名格式：`event_20251226_230829.zip`
+- ZIP 文件内包含：
+  - `event_20251226_230829/metadata.json`
+  - `event_20251226_230829/device_1.csv`
+  - `event_20251226_230829/device_2.csv`
+  - 等等...
+- 本地会保留 ZIP 文件作为备份
 
 ---
 
@@ -240,19 +245,23 @@ python3 train_detector_stable.py
 事件结束后约 5 秒，应该看到上传日志：
 
 ```
-[INFO] Google Drive upload complete: event_20251226_123456 (5 files)
+[INFO] Created ZIP archive: event_20251226_123456.zip (5 files)
+[INFO] Google Drive upload complete: event_20251226_123456.zip
 ```
 
 ### 步骤 5: 验证 Google Drive
 
 1. 打开 Google Drive：https://drive.google.com/
 2. 进入你创建的备份文件夹
-3. 应该看到新上传的事件文件（不是文件夹），例如：
-   - `event_20251226_123456_metadata.json` (事件元数据)
-   - `event_20251226_123456_device_1.csv` (设备 1 的数据)
-   - `event_20251226_123456_device_2.csv` (设备 2 的数据)
+3. 应该看到新上传的 ZIP 文件，例如：
+   - `event_20251226_123456.zip`
+   - `event_20251226_123501.zip`
+   - `event_20251226_123515.zip`
+4. 下载并解压任意 ZIP 文件，里面包含：
+   - `event_20251226_123456/metadata.json`
+   - `event_20251226_123456/device_1.csv`
+   - `event_20251226_123456/device_2.csv`
    - 等等...
-4. 所有文件都带有事件 ID 前缀，方便区分不同事件
 
 ---
 
@@ -364,7 +373,7 @@ ls -l /home/user/train_detection/service_account.json
 1. 确认你正确共享了文件夹给服务账户
 2. 检查是否在正确的 Google 账户中查看
 3. 检查上传日志中的 folder_id 是否正确
-4. 尝试在 Google Drive 中搜索文件名（例如 `event_20251226_123456_metadata.json`）
+4. 尝试在 Google Drive 中搜索文件名（例如 `event_20251226_123456.zip`）
 
 ---
 

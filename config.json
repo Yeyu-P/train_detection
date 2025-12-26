@@ -77,6 +77,12 @@
     },
     "timeout_sec": 2.0
   },
+  "google_drive": {
+    "enabled": false,
+    "credentials_file": "service_account.json",
+    "folder_id": "",
+    "upload_delay_seconds": 5
+  },
   "output": {
     "directory": "train_events",
     "db_name": "events.db",

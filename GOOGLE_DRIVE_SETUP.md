@@ -195,7 +195,6 @@ python3 -c "from googleapiclient.discovery import build; print('Google API libra
   "enabled": true,
   "credentials_file": "service_account.json",
   "folder_id": "1a2B3c4D5e6F7g8H9i0J1k2L3m4N5o6P",
-  "owner_email": "your-email@gmail.com",
   "upload_delay_seconds": 5
 }
 ```
@@ -204,8 +203,12 @@ python3 -c "from googleapiclient.discovery import build; print('Google API libra
 - `enabled`: 设置为 `true` 启用 Google Drive 上传
 - `credentials_file`: 凭证文件路径（相对于项目根目录）
 - `folder_id`: 前面获取的 Google Drive 文件夹 ID
-- `owner_email`: **重要！** 你的 Google 账号邮箱（用于自动转移文件夹所有权，避免服务账户存储配额限制）
 - `upload_delay_seconds`: 事件结束后延迟多少秒再上传（默认 5 秒，确保文件已完全写入）
+
+**文件组织方式**：
+- 所有事件文件直接上传到你指定的文件夹，不创建子文件夹
+- 文件名格式：`event_20251226_230829_metadata.json`、`event_20251226_230829_device_1.csv` 等
+- 使用事件 ID 前缀区分不同事件的文件
 
 ---
 
@@ -237,20 +240,19 @@ python3 train_detector_stable.py
 事件结束后约 5 秒，应该看到上传日志：
 
 ```
-[INFO] Event folder uploaded to Google Drive: event_20251226_123456
-[INFO] Google Drive folder ID: 1xY2zW3vU4tS5rQ6pO...
+[INFO] Google Drive upload complete: event_20251226_123456 (5 files)
 ```
 
 ### 步骤 5: 验证 Google Drive
 
 1. 打开 Google Drive：https://drive.google.com/
 2. 进入你创建的备份文件夹
-3. 应该看到新上传的事件文件夹（例如 `event_20251226_123456`）
-4. 打开文件夹，检查是否包含：
-   - `event_metadata.json` (事件元数据)
-   - `device_1.csv` (设备 1 的数据)
-   - `device_2.csv` (设备 2 的数据)
+3. 应该看到新上传的事件文件（不是文件夹），例如：
+   - `event_20251226_123456_metadata.json` (事件元数据)
+   - `event_20251226_123456_device_1.csv` (设备 1 的数据)
+   - `event_20251226_123456_device_2.csv` (设备 2 的数据)
    - 等等...
+4. 所有文件都带有事件 ID 前缀，方便区分不同事件
 
 ---
 
@@ -285,36 +287,25 @@ ls -l /home/user/train_detection/service_account.json
 
 ### 问题 3: 上传时报错 "Service Accounts do not have storage quota" 或 "storageQuotaExceeded"
 
-**原因**：服务账户自己没有存储空间，但系统试图把文件上传到服务账户自己的 Drive
-
-**最常见原因**：
-1. `owner_email` 配置为空或未设置
-2. 文件夹所有权未正确转移
+**原因**：共享文件夹不是你创建的，或者文件夹所有权属于服务账户
 
 **解决方法**：
 
-1. **确认 `owner_email` 已配置**：
-   ```json
-   "google_drive": {
-     "enabled": true,
-     "owner_email": "your-email@gmail.com"  // 必须填写你的 Gmail 地址
-   }
-   ```
+1. **确保文件夹是在你的个人 Google Drive 中创建的**（不是服务账户创建的）
 
-2. **邮箱地址必须是登录 Google Drive 的那个账号**
+2. **确认文件夹已正确共享给服务账户**：
+   - 在 Google Drive 中右键点击文件夹 > 共享
+   - 检查服务账户邮箱是否在共享列表中
+   - 权限必须是"编辑者"
 
-3. **重启系统**让配置生效
+3. **验证 folder_id 指向的是你自己拥有的文件夹**
 
-4. **验证配置**：
-   ```bash
-   grep owner_email config.json
-   ```
-   应该显示你的邮箱地址，不能是空字符串
+4. **重启系统**让配置生效
 
 **工作原理**：
-- 服务账户创建文件夹后，立即把所有权转移给你
-- 文件上传到你拥有的文件夹，使用你的存储空间
-- 这样就不会触发服务账户的存储配额限制
+- 文件直接上传到你拥有的共享文件夹中
+- 使用你的 Google Drive 存储空间
+- 不创建子文件夹，避免所有权转移问题
 
 ---
 
@@ -373,7 +364,7 @@ ls -l /home/user/train_detection/service_account.json
 1. 确认你正确共享了文件夹给服务账户
 2. 检查是否在正确的 Google 账户中查看
 3. 检查上传日志中的 folder_id 是否正确
-4. 尝试在 Google Drive 中搜索文件夹名称（例如 `event_20251226_123456`）
+4. 尝试在 Google Drive 中搜索文件名（例如 `event_20251226_123456_metadata.json`）
 
 ---
 

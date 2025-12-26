@@ -515,7 +515,6 @@ class GoogleDriveUploader:
         self.credentials_file = gdrive_config.get('credentials_file', 'service_account.json')
         self.folder_id = gdrive_config.get('folder_id', '')
         self.upload_delay = gdrive_config.get('upload_delay_seconds', 5)
-        self.owner_email = gdrive_config.get('owner_email', '')  # NEW: User's email for ownership transfer
 
         self.upload_count = 0
         self.upload_failures = 0
@@ -556,7 +555,7 @@ class GoogleDriveUploader:
             self.enabled = False
 
     async def upload_event_folder(self, event_dir_path):
-        """Upload event folder to Google Drive (non-blocking)"""
+        """Upload event files directly to Google Drive (non-blocking)"""
         if not self.enabled or not self.service:
             return
 
@@ -571,68 +570,39 @@ class GoogleDriveUploader:
             # Wait a bit to ensure all files are written
             await asyncio.sleep(self.upload_delay)
 
-            # Create folder in Google Drive
-            folder_metadata = {
-                'name': event_dir.name,
-                'mimeType': 'application/vnd.google-apps.folder',
-                'parents': [self.folder_id] if self.folder_id else []
-            }
+            # Get event name prefix (e.g., "event_20251226_230829")
+            event_prefix = event_dir.name
 
-            folder = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.service.files().create(body=folder_metadata, fields='id').execute()
-            )
-            drive_folder_id = folder.get('id')
-
-            logger.info(f"Created Google Drive folder: {event_dir.name}")
-
-            # Transfer ownership to user to avoid service account storage quota issue
-            if self.owner_email:
-                try:
-                    permission = {
-                        'type': 'user',
-                        'role': 'owner',
-                        'emailAddress': self.owner_email
-                    }
-                    await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: self.service.permissions().create(
-                            fileId=drive_folder_id,
-                            body=permission,
-                            transferOwnership=True
-                        ).execute()
-                    )
-                    logger.info(f"Transferred folder ownership to {self.owner_email}")
-                except Exception as e:
-                    logger.warning(f"Failed to transfer ownership: {e}")
-                    # Continue anyway - folder is still accessible
-
-            # Upload all files in the event directory
+            # Upload all files directly to the shared folder with event prefix
             uploaded_files = 0
             for file_path in event_dir.iterdir():
                 if file_path.is_file():
+                    # Add event prefix to filename: event_20251226_230829_metadata.json
+                    prefixed_name = f"{event_prefix}_{file_path.name}"
+
                     file_metadata = {
-                        'name': file_path.name,
-                        'parents': [drive_folder_id]
+                        'name': prefixed_name,
+                        'parents': [self.folder_id] if self.folder_id else []
                     }
 
                     media = MediaFileUpload(str(file_path), resumable=True)
 
-                    await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: self.service.files().create(
-                            body=file_metadata,
-                            media_body=media,
+                    # Use a wrapper function to capture the current media object
+                    def upload_file(metadata=file_metadata, media_obj=media):
+                        return self.service.files().create(
+                            body=metadata,
+                            media_body=media_obj,
                             fields='id'
                         ).execute()
-                    )
+
+                    await asyncio.get_event_loop().run_in_executor(None, upload_file)
 
                     uploaded_files += 1
-                    logger.debug(f"Uploaded to Google Drive: {file_path.name}")
+                    logger.debug(f"Uploaded to Google Drive: {prefixed_name}")
 
             self.upload_count += 1
-            logger.info(f"Google Drive upload complete: {event_dir.name} ({uploaded_files} files)")
-            print(f"   Uploaded to Google Drive: {event_dir.name} ({uploaded_files} files)")
+            logger.info(f"Google Drive upload complete: {event_prefix} ({uploaded_files} files)")
+            print(f"   Uploaded to Google Drive: {event_prefix} ({uploaded_files} files)")
 
         except Exception as e:
             self.upload_failures += 1

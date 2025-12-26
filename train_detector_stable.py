@@ -500,6 +500,124 @@ class EventUploader:
             logger.debug(f"Warning upload error: {e}")
 
 
+class GoogleDriveUploader:
+    """
+    Google Drive uploader for automatic event data backup
+    Uploads event folders to Google Drive for long-term storage
+    Uses service account for unattended operation
+    """
+
+    def __init__(self, config):
+        self.config = config
+        gdrive_config = config.get('google_drive', {})
+
+        self.enabled = gdrive_config.get('enabled', False)
+        self.credentials_file = gdrive_config.get('credentials_file', 'service_account.json')
+        self.folder_id = gdrive_config.get('folder_id', '')
+        self.upload_delay = gdrive_config.get('upload_delay_seconds', 5)
+
+        self.upload_count = 0
+        self.upload_failures = 0
+
+        # Try to initialize Google Drive API
+        self.service = None
+        if self.enabled:
+            self._initialize_drive_service()
+
+    def _initialize_drive_service(self):
+        """Initialize Google Drive API service"""
+        try:
+            from google.oauth2 import service_account
+            from googleapiclient.discovery import build
+
+            if not os.path.exists(self.credentials_file):
+                logger.error(f"Google Drive credentials file not found: {self.credentials_file}")
+                print(f"Google Drive: Credentials file not found, upload disabled")
+                self.enabled = False
+                return
+
+            credentials = service_account.Credentials.from_service_account_file(
+                self.credentials_file,
+                scopes=['https://www.googleapis.com/auth/drive.file']
+            )
+
+            self.service = build('drive', 'v3', credentials=credentials)
+            logger.info("Google Drive uploader initialized successfully")
+            print(f"Google Drive uploader enabled: Folder ID {self.folder_id}")
+
+        except ImportError:
+            logger.error("Google Drive libraries not installed. Run: pip install google-api-python-client google-auth")
+            print("Google Drive: Required libraries not installed, upload disabled")
+            self.enabled = False
+        except Exception as e:
+            logger.error(f"Google Drive initialization error: {e}")
+            print(f"Google Drive initialization failed: {e}")
+            self.enabled = False
+
+    async def upload_event_folder(self, event_dir_path):
+        """Upload event folder to Google Drive (non-blocking)"""
+        if not self.enabled or not self.service:
+            return
+
+        try:
+            from googleapiclient.http import MediaFileUpload
+
+            event_dir = Path(event_dir_path)
+            if not event_dir.exists():
+                logger.warning(f"Event directory not found: {event_dir}")
+                return
+
+            # Wait a bit to ensure all files are written
+            await asyncio.sleep(self.upload_delay)
+
+            # Create folder in Google Drive
+            folder_metadata = {
+                'name': event_dir.name,
+                'mimeType': 'application/vnd.google-apps.folder',
+                'parents': [self.folder_id] if self.folder_id else []
+            }
+
+            folder = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.service.files().create(body=folder_metadata, fields='id').execute()
+            )
+            drive_folder_id = folder.get('id')
+
+            logger.info(f"Created Google Drive folder: {event_dir.name}")
+
+            # Upload all files in the event directory
+            uploaded_files = 0
+            for file_path in event_dir.iterdir():
+                if file_path.is_file():
+                    file_metadata = {
+                        'name': file_path.name,
+                        'parents': [drive_folder_id]
+                    }
+
+                    media = MediaFileUpload(str(file_path), resumable=True)
+
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.service.files().create(
+                            body=file_metadata,
+                            media_body=media,
+                            fields='id'
+                        ).execute()
+                    )
+
+                    uploaded_files += 1
+                    logger.debug(f"Uploaded to Google Drive: {file_path.name}")
+
+            self.upload_count += 1
+            logger.info(f"Google Drive upload complete: {event_dir.name} ({uploaded_files} files)")
+            print(f"   Uploaded to Google Drive: {event_dir.name} ({uploaded_files} files)")
+
+        except Exception as e:
+            self.upload_failures += 1
+            logger.error(f"Google Drive upload error: {e}")
+            print(f"   Google Drive upload failed: {e}")
+
+
 class HealthUploader:
     """
     NEW: Non-blocking health data uploader
@@ -678,6 +796,9 @@ class TrainDetector:
 
         # NEW: Event uploader (can be disabled via config)
         self.event_uploader = EventUploader(self.config)
+
+        # NEW: Google Drive uploader (can be disabled via config)
+        self.gdrive_uploader = GoogleDriveUploader(self.config)
 
         # NEW: Save operation lock (prevent race conditions)
         self._save_lock = asyncio.Lock()
@@ -1373,6 +1494,13 @@ class TrainDetector:
                     summary_devices
                 )
             )
+
+            # NEW: Upload to Google Drive (non-blocking, fire-and-forget)
+            asyncio.create_task(
+                self.gdrive_uploader.upload_event_folder(
+                    str(self.output_dir / f"event_{event_id}")
+                )
+            )
     
     def _save_event_data_sync(self, event_id, trigger_device, trigger_time, duration, event_data_copy):
         """
@@ -1538,7 +1666,11 @@ class TrainDetector:
         if self.event_uploader.enabled:
             print(f"Event Upload Count: {self.event_uploader.upload_count}")
             print(f"Event Upload Failures: {self.event_uploader.upload_failures}")
-        
+
+        if self.gdrive_uploader.enabled:
+            print(f"Google Drive Upload Count: {self.gdrive_uploader.upload_count}")
+            print(f"Google Drive Upload Failures: {self.gdrive_uploader.upload_failures}")
+
         if self.stats['last_event_time']:
             last = datetime.fromtimestamp(self.stats['last_event_time'])
             print(f"Last Event: {last.strftime('%Y-%m-%d %H:%M:%S')}")

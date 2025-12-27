@@ -623,6 +623,238 @@ class GoogleDriveUploader:
             print(f"   Google Drive upload failed: {e}")
 
 
+class OneDriveUploader:
+    """
+    OneDrive uploader for automatic event data backup
+    Uses Microsoft Graph API with refresh token authentication
+    Free tier: 5GB storage
+    """
+
+    def __init__(self, config):
+        self.config = config
+        onedrive_config = config.get('onedrive', {})
+
+        self.enabled = onedrive_config.get('enabled', False)
+        self.client_id = onedrive_config.get('client_id', '')
+        self.client_secret = onedrive_config.get('client_secret', '')
+        self.refresh_token = onedrive_config.get('refresh_token', '')
+        self.upload_folder = onedrive_config.get('upload_folder', 'TrainDetection')
+        self.upload_delay = onedrive_config.get('upload_delay_seconds', 5)
+
+        self.upload_count = 0
+        self.upload_failures = 0
+        self.access_token = None
+        self.token_expiry = 0
+
+        if self.enabled:
+            if not all([self.client_id, self.client_secret, self.refresh_token]):
+                logger.error("OneDrive: Missing required configuration")
+                print("OneDrive: Missing client_id, client_secret, or refresh_token")
+                self.enabled = False
+            else:
+                logger.info("OneDrive uploader initialized")
+                print(f"OneDrive uploader enabled: Folder '{self.upload_folder}'")
+
+    def _get_access_token(self):
+        """Get or refresh access token"""
+        import time
+        import requests
+
+        # Check if current token is still valid (with 5 min buffer)
+        if self.access_token and time.time() < (self.token_expiry - 300):
+            return self.access_token
+
+        # Refresh token
+        try:
+            response = requests.post(
+                'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+                data={
+                    'client_id': self.client_id,
+                    'client_secret': self.client_secret,
+                    'refresh_token': self.refresh_token,
+                    'grant_type': 'refresh_token',
+                    'scope': 'files.readwrite offline_access'
+                },
+                timeout=10
+            )
+            response.raise_for_status()
+            token_data = response.json()
+
+            self.access_token = token_data['access_token']
+            self.token_expiry = time.time() + token_data.get('expires_in', 3600)
+
+            # Update refresh token if provided
+            if 'refresh_token' in token_data:
+                self.refresh_token = token_data['refresh_token']
+
+            return self.access_token
+
+        except Exception as e:
+            logger.error(f"OneDrive token refresh failed: {e}")
+            return None
+
+    async def upload_event_folder(self, event_dir_path):
+        """Compress event folder to ZIP and upload to OneDrive (non-blocking)"""
+        if not self.enabled:
+            return
+
+        try:
+            import zipfile
+            import requests
+
+            event_dir = Path(event_dir_path)
+            if not event_dir.exists():
+                logger.warning(f"Event directory not found: {event_dir}")
+                return
+
+            # Wait a bit to ensure all files are written
+            await asyncio.sleep(self.upload_delay)
+
+            # Get event name
+            event_name = event_dir.name
+            zip_path = event_dir.parent / f"{event_name}.zip"
+
+            # Create ZIP file (reuse from Google Drive logic)
+            def create_zip():
+                with zipfile.ZipFile(str(zip_path), 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    file_count = 0
+                    for file_path in event_dir.iterdir():
+                        if file_path.is_file():
+                            arcname = f"{event_name}/{file_path.name}"
+                            zipf.write(str(file_path), arcname)
+                            file_count += 1
+                    return file_count
+
+            file_count = await asyncio.get_event_loop().run_in_executor(None, create_zip)
+            logger.info(f"Created ZIP archive for OneDrive: {zip_path.name} ({file_count} files)")
+
+            # Upload to OneDrive
+            def upload_to_onedrive():
+                access_token = self._get_access_token()
+                if not access_token:
+                    raise Exception("Failed to get access token")
+
+                # Upload file using Microsoft Graph API
+                upload_url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{self.upload_folder}/{event_name}.zip:/content"
+
+                with open(zip_path, 'rb') as f:
+                    response = requests.put(
+                        upload_url,
+                        headers={
+                            'Authorization': f'Bearer {access_token}',
+                            'Content-Type': 'application/zip'
+                        },
+                        data=f,
+                        timeout=300
+                    )
+                    response.raise_for_status()
+                    return response.json()
+
+            await asyncio.get_event_loop().run_in_executor(None, upload_to_onedrive)
+
+            self.upload_count += 1
+            logger.info(f"OneDrive upload complete: {event_name}.zip")
+            print(f"   Uploaded to OneDrive: {event_name}.zip ({file_count} files compressed)")
+
+        except Exception as e:
+            self.upload_failures += 1
+            logger.error(f"OneDrive upload error: {e}")
+            print(f"   OneDrive upload failed: {e}")
+
+
+class DropboxUploader:
+    """
+    Dropbox uploader for automatic event data backup
+    Uses Dropbox API with access token authentication
+    Free tier: 2GB storage
+    """
+
+    def __init__(self, config):
+        self.config = config
+        dropbox_config = config.get('dropbox', {})
+
+        self.enabled = dropbox_config.get('enabled', False)
+        self.access_token = dropbox_config.get('access_token', '')
+        self.upload_folder = dropbox_config.get('upload_folder', '/TrainDetection')
+        self.upload_delay = dropbox_config.get('upload_delay_seconds', 5)
+
+        self.upload_count = 0
+        self.upload_failures = 0
+
+        if self.enabled:
+            if not self.access_token:
+                logger.error("Dropbox: Missing access_token")
+                print("Dropbox: Missing access_token in configuration")
+                self.enabled = False
+            else:
+                logger.info("Dropbox uploader initialized")
+                print(f"Dropbox uploader enabled: Folder '{self.upload_folder}'")
+
+    async def upload_event_folder(self, event_dir_path):
+        """Compress event folder to ZIP and upload to Dropbox (non-blocking)"""
+        if not self.enabled:
+            return
+
+        try:
+            import zipfile
+            import requests
+
+            event_dir = Path(event_dir_path)
+            if not event_dir.exists():
+                logger.warning(f"Event directory not found: {event_dir}")
+                return
+
+            # Wait a bit to ensure all files are written
+            await asyncio.sleep(self.upload_delay)
+
+            # Get event name
+            event_name = event_dir.name
+            zip_path = event_dir.parent / f"{event_name}.zip"
+
+            # Create ZIP file
+            def create_zip():
+                with zipfile.ZipFile(str(zip_path), 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    file_count = 0
+                    for file_path in event_dir.iterdir():
+                        if file_path.is_file():
+                            arcname = f"{event_name}/{file_path.name}"
+                            zipf.write(str(file_path), arcname)
+                            file_count += 1
+                    return file_count
+
+            file_count = await asyncio.get_event_loop().run_in_executor(None, create_zip)
+            logger.info(f"Created ZIP archive for Dropbox: {zip_path.name} ({file_count} files)")
+
+            # Upload to Dropbox
+            def upload_to_dropbox():
+                upload_path = f"{self.upload_folder}/{event_name}.zip"
+
+                with open(zip_path, 'rb') as f:
+                    response = requests.post(
+                        'https://content.dropboxapi.com/2/files/upload',
+                        headers={
+                            'Authorization': f'Bearer {self.access_token}',
+                            'Content-Type': 'application/octet-stream',
+                            'Dropbox-API-Arg': f'{{"path":"{upload_path}","mode":"add","autorename":true}}'
+                        },
+                        data=f,
+                        timeout=300
+                    )
+                    response.raise_for_status()
+                    return response.json()
+
+            await asyncio.get_event_loop().run_in_executor(None, upload_to_dropbox)
+
+            self.upload_count += 1
+            logger.info(f"Dropbox upload complete: {event_name}.zip")
+            print(f"   Uploaded to Dropbox: {event_name}.zip ({file_count} files compressed)")
+
+        except Exception as e:
+            self.upload_failures += 1
+            logger.error(f"Dropbox upload error: {e}")
+            print(f"   Dropbox upload failed: {e}")
+
+
 class HealthUploader:
     """
     NEW: Non-blocking health data uploader
@@ -804,6 +1036,8 @@ class TrainDetector:
 
         # NEW: Google Drive uploader (can be disabled via config)
         self.gdrive_uploader = GoogleDriveUploader(self.config)
+        self.onedrive_uploader = OneDriveUploader(self.config)
+        self.dropbox_uploader = DropboxUploader(self.config)
 
         # NEW: Save operation lock (prevent race conditions)
         self._save_lock = asyncio.Lock()
@@ -1500,13 +1734,19 @@ class TrainDetector:
                 )
             )
 
-            # NEW: Upload to Google Drive (non-blocking, fire-and-forget)
+            # NEW: Upload to cloud storage (non-blocking, fire-and-forget)
+            event_folder_path = str(self.output_dir / f"event_{event_id}")
+
             asyncio.create_task(
-                self.gdrive_uploader.upload_event_folder(
-                    str(self.output_dir / f"event_{event_id}")
-                )
+                self.gdrive_uploader.upload_event_folder(event_folder_path)
             )
-    
+            asyncio.create_task(
+                self.onedrive_uploader.upload_event_folder(event_folder_path)
+            )
+            asyncio.create_task(
+                self.dropbox_uploader.upload_event_folder(event_folder_path)
+            )
+
     def _save_event_data_sync(self, event_id, trigger_device, trigger_time, duration, event_data_copy):
         """
         Synchronous file I/O (runs in executor)
@@ -1675,6 +1915,14 @@ class TrainDetector:
         if self.gdrive_uploader.enabled:
             print(f"Google Drive Upload Count: {self.gdrive_uploader.upload_count}")
             print(f"Google Drive Upload Failures: {self.gdrive_uploader.upload_failures}")
+
+        if self.onedrive_uploader.enabled:
+            print(f"OneDrive Upload Count: {self.onedrive_uploader.upload_count}")
+            print(f"OneDrive Upload Failures: {self.onedrive_uploader.upload_failures}")
+
+        if self.dropbox_uploader.enabled:
+            print(f"Dropbox Upload Count: {self.dropbox_uploader.upload_count}")
+            print(f"Dropbox Upload Failures: {self.dropbox_uploader.upload_failures}")
 
         if self.stats['last_event_time']:
             last = datetime.fromtimestamp(self.stats['last_event_time'])

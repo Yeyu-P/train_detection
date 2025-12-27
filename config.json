@@ -83,6 +83,20 @@
     "folder_id": "",
     "upload_delay_seconds": 5
   },
+  "onedrive": {
+    "enabled": false,
+    "client_id": "",
+    "client_secret": "",
+    "refresh_token": "",
+    "upload_folder": "TrainDetection",
+    "upload_delay_seconds": 5
+  },
+  "dropbox": {
+    "enabled": false,
+    "access_token": "",
+    "upload_folder": "/TrainDetection",
+    "upload_delay_seconds": 5
+  },
   "output": {
     "directory": "train_events",
     "db_name": "events.db",
